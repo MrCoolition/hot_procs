@@ -472,25 +472,93 @@ def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
     return seen
 
 
+def build_streamlit_proc_hardening_guide(database: str, schema: str, proc_name: str) -> str:
+    fq_table = f'{database}.{schema}.OPENSTOCKREPORT'
+    fq_proc = f'{database}.{schema}.{proc_name}'
+    return '\n'.join([
+        '# Proc hardening rules for Streamlit/Snowpark compatibility',
+        '',
+        '1. Remove all USE statements from procedure code:',
+        '   - USE DATABASE',
+        '   - USE SCHEMA',
+        '   - USE WAREHOUSE',
+        '   - USE ROLE',
+        '',
+        '2. Fully qualify every object reference:',
+        '   - db.schema.table',
+        '   - db.schema.view',
+        '   - db.schema.stage',
+        '   - db.schema.function',
+        '   - db.schema.procedure',
+        '',
+        '3. Fully qualify the procedure call site:',
+        '   - CALL db.schema.proc_name(...)',
+        '',
+        '4. Fully qualify all SQL inside EXECUTE IMMEDIATE strings.',
+        '',
+        '5. Do not rely on session context for object resolution.',
+        '',
+        '6. Do not rely on worksheet-selected database/schema/warehouse.',
+        '',
+        '7. Preserve EXECUTE AS behavior explicitly:',
+        '   - EXECUTE AS OWNER or EXECUTE AS CALLER',
+        '   - do not assume session role/context will fill gaps',
+        '',
+        'Example translation:',
+        '```sql',
+        f'USE DATABASE {database};',
+        f'USE SCHEMA {schema};',
+        '',
+        'SELECT * FROM OPENSTOCKREPORT;',
+        f"CALL {proc_name}('20260316','20260323');",
+        '',
+        '-- becomes --',
+        '',
+        f'SELECT * FROM {fq_table};',
+        f"CALL {fq_proc}('20260316','20260323');",
+        '',
+        f"EXECUTE IMMEDIATE 'UPDATE OPENSTOCKREPORT SET ...';",
+        '',
+        '-- becomes --',
+        '',
+        f"EXECUTE IMMEDIATE 'UPDATE {fq_table} SET ...';",
+        '```',
+        '',
+        'If the procedure still fails after qualification, check for:',
+        '- USE ROLE or role switching requirements.',
+        '- Dynamically built object names that also need qualification.',
+        '- Missing USAGE/privileges for the Streamlit caller role.',
+    ])
+
+
 def build_use_statement_remediation(database: str, schema: str, proc_name: str, statements: Sequence[str]) -> Dict[str, Any]:
     fq_proc = f'{database}.{schema}.{proc_name}'
     quoted_fq_proc = f'{qident(database)}.{qident(schema)}.{qident(proc_name)}'
     unique_statements = list(dict.fromkeys(str(stmt).strip() for stmt in statements if str(stmt).strip()))
+    hardening_guide = build_streamlit_proc_hardening_guide(database, schema, proc_name)
     return {
         'summary': 'This procedure cannot run from Streamlit because its body changes Snowflake session context.',
         'details': [
             'Detected session-changing statements in the procedure definition: ' + ', '.join(unique_statements) + '.',
             'Snowflake blocks these statements when the procedure is invoked from Streamlit or other restricted runtimes.',
-            f'Remove those statements from {fq_proc} and fully qualify every referenced object inside the procedure body.',
+            f'Convert {fq_proc} from session-context-driven SQL to fully qualified SQL so object resolution does not depend on USE statements.',
         ],
-        'hint': 'Update the stored procedure to remove USE statements from its execution path and fully qualify referenced objects instead.',
+        'hint': 'Yes: rewrite the procedure to remove USE statements, fully qualify every referenced object, and qualify SQL inside EXECUTE IMMEDIATE strings.',
         'developer_note': '\n'.join([
             f'Procedure: {quoted_fq_proc}',
             'Blocked statements: ' + ', '.join(unique_statements),
+            '',
+            'Answer:',
+            'Yes. Convert the procedure from session-context-driven SQL to fully qualified SQL, and it should run from Streamlit if context dependence is the blocker.',
+            '',
             'Recommended fix:',
             '  1. Delete USE DATABASE / USE SCHEMA / USE ROLE / USE WAREHOUSE statements from the procedure body.',
             '  2. Replace unqualified object references with fully qualified names such as "DB"."SCHEMA"."OBJECT".',
-            '  3. Recreate the procedure and retry the report from Streamlit.',
+            '  3. Fully qualify SQL inside EXECUTE IMMEDIATE strings too.',
+            '  4. Preserve EXECUTE AS OWNER/CALLER explicitly and verify privileges.',
+            '  5. Recreate the procedure and retry the report from Streamlit.',
+            '',
+            hardening_guide,
         ]),
     }
 

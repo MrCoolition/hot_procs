@@ -72,3 +72,12 @@ def test_call_builder_omits_defaulted_params():
 
 def test_overload_safe_session_key_generation():
     assert proc_instance_key('DB', 'SCH', 'PROC', '(NUMBER)') != proc_instance_key('DB', 'SCH', 'PROC', '(VARCHAR)')
+
+
+def test_call_builder_supports_positional_arguments_for_generic_param_names():
+    submissions = [
+        ('ARG1', build_param_submission('NULL', None, 'NUMBER', 'NULL')),
+        ('ARG2', build_param_submission('VALUE', 'CSV', 'VARCHAR', 'CSV')),
+    ]
+    sql = build_call_sql('DB', 'SCHEMA', 'PROC', submissions, named_args=False)
+    assert sql == "CALL \"DB\".\"SCHEMA\".\"PROC\"(NULL, 'CSV');"

@@ -459,6 +459,8 @@ def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
     if not text:
         return []
     matches = re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', text)
+    for quoted in re.findall(r"'([^']*)'", text):
+        matches.extend(re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', quoted))
     normalized = []
     for match in matches:
         stmt = re.sub(r'\s+', ' ', str(match).upper()).strip()
@@ -468,6 +470,29 @@ def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
         if stmt not in seen:
             seen.append(stmt)
     return seen
+
+
+def build_use_statement_remediation(database: str, schema: str, proc_name: str, statements: Sequence[str]) -> Dict[str, Any]:
+    fq_proc = f'{database}.{schema}.{proc_name}'
+    quoted_fq_proc = f'{qident(database)}.{qident(schema)}.{qident(proc_name)}'
+    unique_statements = list(dict.fromkeys(str(stmt).strip() for stmt in statements if str(stmt).strip()))
+    return {
+        'summary': 'This procedure cannot run from Streamlit because its body changes Snowflake session context.',
+        'details': [
+            'Detected session-changing statements in the procedure definition: ' + ', '.join(unique_statements) + '.',
+            'Snowflake blocks these statements when the procedure is invoked from Streamlit or other restricted runtimes.',
+            f'Remove those statements from {fq_proc} and fully qualify every referenced object inside the procedure body.',
+        ],
+        'hint': 'Update the stored procedure to remove USE statements from its execution path and fully qualify referenced objects instead.',
+        'developer_note': '\n'.join([
+            f'Procedure: {quoted_fq_proc}',
+            'Blocked statements: ' + ', '.join(unique_statements),
+            'Recommended fix:',
+            '  1. Delete USE DATABASE / USE SCHEMA / USE ROLE / USE WAREHOUSE statements from the procedure body.',
+            '  2. Replace unqualified object references with fully qualified names such as "DB"."SCHEMA"."OBJECT".',
+            '  3. Recreate the procedure and retry the report from Streamlit.',
+        ]),
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -525,7 +550,11 @@ def analyze_execution_error(message: Any) -> Dict[str, Any]:
         category = 'unsupported_statement'
         summary = f'Unsupported statement inside the stored procedure: {object_name}'
         details.append('The stored procedure tried to execute a SQL statement type that is not allowed in this runtime.')
-        hint = 'Remove session-changing statements such as USE DATABASE/SCHEMA from the execution path, or fully qualify object references before retrying.'
+        if object_name == 'USE':
+            details.append('This usually means the procedure body contains USE DATABASE, USE SCHEMA, USE ROLE, or USE WAREHOUSE statements.')
+            hint = 'Remove those USE statements from the procedure body and fully qualify referenced objects before retrying.'
+        else:
+            hint = 'Remove session-changing statements such as USE DATABASE/SCHEMA from the execution path, or fully qualify object references before retrying.'
         return {
             'category': category,
             'summary': summary,
@@ -2474,14 +2503,7 @@ with tab_report:
         proc_ddl = get_procedure_ddl(db, schema, proc_name, type_sig)
         unsupported_use_statements = extract_unsupported_use_statements(proc_ddl)
         if unsupported_use_statements:
-            preflight_issue = {
-                'summary': 'This procedure cannot run from Streamlit because its body changes Snowflake session context.',
-                'details': [
-                    'Detected session-changing statements in the procedure definition: ' + ', '.join(unsupported_use_statements) + '.',
-                    'Snowflake blocks these statements when the procedure is invoked from this runtime.',
-                ],
-                'hint': 'Update the stored procedure to remove USE statements from its execution path and fully qualify referenced objects instead.',
-            }
+            preflight_issue = build_use_statement_remediation(db, schema, proc_name, unsupported_use_statements)
     except Exception:
         preflight_issue = None
 
@@ -2507,6 +2529,9 @@ with tab_report:
             st.caption(detail)
         if preflight_issue.get('hint'):
             st.info(preflight_issue['hint'])
+        if preflight_issue.get('developer_note'):
+            with st.expander('Developer handoff', expanded=False):
+                st.code(preflight_issue['developer_note'])
     run_row = st.columns([1.2,1.2,4])
     run_clicked = run_row[0].button('🚀 Run report', type='primary', disabled=run_disabled)
     clear_clicked = run_row[1].button('🧹 Clear inputs')
@@ -2567,6 +2592,10 @@ with tab_report:
                 st.caption(detail)
             if err_info.get('hint'):
                 st.info(err_info['hint'])
+            if err_info.get('category') == 'unsupported_statement' and err_info.get('object_name') == 'USE':
+                runtime_use_issue = build_use_statement_remediation(db, schema, proc_name, ['USE'])
+                with st.expander('Developer handoff', expanded=False):
+                    st.code(runtime_use_issue['developer_note'])
             if qid:
                 st.caption(f'Last query ID: {qid}')
             with st.expander('Raw Snowflake error', expanded=False):

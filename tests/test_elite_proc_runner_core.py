@@ -1,4 +1,5 @@
 from elite_proc_runner_core import (
+    ProcUIMeta,
     humanize_identifier_advanced,
     is_time,
     is_timestamp,
@@ -9,6 +10,7 @@ from elite_proc_runner_core import (
     build_call_sql,
     proc_instance_key,
     analyze_execution_error,
+    resolve_param_ui_meta,
 )
 
 
@@ -89,3 +91,15 @@ def test_analyze_execution_error_for_missing_function_dependency():
     assert err['category'] == 'missing_function'
     assert err['object_name'] == 'SYSTEM.GETCONTRACTPERIODKEYFORDATE'
     assert 'Verify that the function exists' in err['hint']
+
+
+def test_required_params_do_not_offer_null_mode_even_when_global_nulls_enabled():
+    proc_meta = ProcUIMeta('DB', 'SCHEMA', 'PROC', '(NUMBER)', 'Proc')
+
+    required_param = resolve_param_ui_meta(proc_meta, {'name': 'TABKEY', 'type': 'NUMBER'}, 1, allow_null=True)
+    optional_param = resolve_param_ui_meta(proc_meta, {'name': 'TABKEY', 'type': 'NUMBER', 'default': '42'}, 1, allow_null=True)
+
+    assert required_param.required is True
+    assert required_param.allow_null is False
+    assert optional_param.required is False
+    assert optional_param.allow_null is True

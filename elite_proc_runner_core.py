@@ -295,6 +295,7 @@ def resolve_param_ui_meta(proc_ui_meta: ProcUIMeta, param: Dict[str, Any], ordin
     param_name = str(param.get('name') or f'ARG{ordinal}')
     default_value = param.get('default')
     has_default = default_value not in (None, '')
+    required = not has_default
     if overlay_row:
         label_seed = overlay_row.get('DISPLAY_LABEL') or overlay_row.get('EXPORTPARAMTOKEN') or overlay_row.get('EXPORTPARAMNAME') or param_name
         label_seed = str(label_seed).lstrip('@')
@@ -307,6 +308,7 @@ def resolve_param_ui_meta(proc_ui_meta: ProcUIMeta, param: Dict[str, Any], ordin
     display_label = humanize_identifier_advanced(label_seed, aliases=aliases)
     short_label = display_label
     lookup_key = normalize_name(label_seed) or normalize_name(param_name)
+    allow_null_selection = allow_null and not required
     return ParamUIMeta(
         param_name=param_name,
         ordinal=ordinal,
@@ -317,10 +319,10 @@ def resolve_param_ui_meta(proc_ui_meta: ProcUIMeta, param: Dict[str, Any], ordin
         display_order=ordinal,
         default_mode='proc_default' if has_default else 'none',
         default_value=default_value,
-        allow_null=allow_null,
+        allow_null=allow_null_selection,
         lookup_key=lookup_key,
         list_encoding='csv',
-        required=not has_default,
+        required=required,
         source=source,
     )
 

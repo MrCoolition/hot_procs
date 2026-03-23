@@ -28,6 +28,7 @@ from elite_proc_runner_core import (
     is_variantish, is_stringish, sql_literal, match_export_metadata, resolve_proc_ui_meta,
     resolve_param_ui_meta, resolve_lookup_ui_meta, disambiguate_lookup_labels, proc_instance_key,
     build_param_submission, build_call_sql, validate_variant_json, normalize_name,
+    analyze_execution_error,
 )
 
 # =========================================================
@@ -1878,8 +1879,40 @@ with tab_report:
             push_history(st.session_state['last_run'])
             st.success(f'Execution successful · {len(out_df):,} rows · {duration_s:.2f}s')
         except Exception as e:
-            st.error('Execution failed')
-            st.code(str(e))
+            err_info = analyze_execution_error(e)
+            qid = None
+            try:
+                qid = session.sql('SELECT LAST_QUERY_ID() AS QID').to_pandas().iloc[0]['QID']
+            except Exception:
+                pass
+            failure_run = {
+                'when': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                'db': db,
+                'schema': schema,
+                'proc': proc_name,
+                'proc_instance_key': proc_key,
+                'display_name': proc_meta.display_name,
+                'type_sig': type_sig,
+                'sql': call_sql,
+                'summary': submission_display,
+                'duration_s': None,
+                'rows': 0,
+                'cols': 0,
+                'query_id': qid,
+                'status': 'failed',
+                'error_summary': err_info.get('summary') or 'Execution failed',
+            }
+            st.session_state['last_run'] = failure_run
+            push_history(failure_run)
+            st.error(err_info.get('summary') or 'Execution failed')
+            for detail in err_info.get('details') or []:
+                st.caption(detail)
+            if err_info.get('hint'):
+                st.info(err_info['hint'])
+            if qid:
+                st.caption(f'Last query ID: {qid}')
+            with st.expander('Raw Snowflake error', expanded=False):
+                st.code(err_info.get('raw_message') or str(e))
 
     if 'last_run' in st.session_state and 'last_result_df' in st.session_state:
         lr = st.session_state['last_run']

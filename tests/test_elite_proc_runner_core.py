@@ -8,6 +8,7 @@ from elite_proc_runner_core import (
     build_param_submission,
     build_call_sql,
     proc_instance_key,
+    analyze_execution_error,
 )
 
 
@@ -81,3 +82,10 @@ def test_call_builder_supports_positional_arguments_for_generic_param_names():
     ]
     sql = build_call_sql('DB', 'SCHEMA', 'PROC', submissions, named_args=False)
     assert sql == "CALL \"DB\".\"SCHEMA\".\"PROC\"(NULL, 'CSV');"
+
+
+def test_analyze_execution_error_for_missing_function_dependency():
+    err = analyze_execution_error("(1304): x: SQL compilation error: Unknown user-defined function SYSTEM.GETCONTRACTPERIODKEYFORDATE.")
+    assert err['category'] == 'missing_function'
+    assert err['object_name'] == 'SYSTEM.GETCONTRACTPERIODKEYFORDATE'
+    assert 'Verify that the function exists' in err['hint']

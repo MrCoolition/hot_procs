@@ -20,6 +20,15 @@ import re
 import time as _time
 from datetime import date, time, datetime
 from typing import Optional, Dict, Any, List, Tuple
+import json
+
+from elite_proc_runner_core import (
+    ProcUIMeta, ParamUIMeta, LookupUIMeta, ParamSubmission,
+    humanize_identifier_advanced, is_numeric, is_bool, is_date, is_time, is_timestamp,
+    is_variantish, is_stringish, sql_literal, match_export_metadata, resolve_proc_ui_meta,
+    resolve_param_ui_meta, resolve_lookup_ui_meta, disambiguate_lookup_labels, proc_instance_key,
+    build_param_submission, build_call_sql, validate_variant_json, normalize_name,
+)
 
 # =========================================================
 # App Config
@@ -147,53 +156,35 @@ st.caption(APP_SUBTITLE)
 # Sidebar Settings
 # =========================================================
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Report settings")
 
-    CFG_SMART_LOOKUPS = st.checkbox("Smart lookups for KEY/ID params", value=True)
-    CFG_ENABLE_LIST_LOOKUPS = st.checkbox("Smart lookups for *KEYLIST/*IDLIST params", value=True)
-    CFG_SMART_LOOKUPS_FOR_STRING_CODE = st.checkbox("Also try lookups for *CODE params", value=False)
+    CFG_ALLOW_NULLS = True
+    CFG_EMPTY_TEXT_AS_NULL = True
+    CFG_USE_NAMED_ARGS = True
+    CFG_HUMANIZE_NAMES = True
+    CFG_ENABLE_METADATA_OVERLAY = True
+    CFG_SMART_LOOKUPS = True
+    CFG_ENABLE_LIST_LOOKUPS = True
+    CFG_SMART_LOOKUPS_FOR_STRING_CODE = False
+    CFG_USE_LOOKUP_CONFIG = True
+    CFG_LOOKUP_CONFIG_FQN = DEFAULT_LOOKUP_CONFIG_FQN
+    CFG_LOOKUP_PAGE_SIZE = 250
+    CFG_LOOKUP_DISCOVERY_TABLE_LIMIT = 400
+    CFG_SHOW_DEBUG = False
+    CFG_SHOW_IDS_IN_LOOKUPS = False
 
-    CFG_ALLOW_NULLS = st.checkbox("Allow NULL for any parameter", value=True)
-    CFG_EMPTY_TEXT_AS_NULL = st.checkbox("Treat empty text/JSON as NULL", value=True)
-
-    CFG_SHOW_IDS_IN_LOOKUPS = st.checkbox("Show IDs in lookup labels", value=True)
-
-    st.divider()
-    st.subheader("Lookup Authority")
-    CFG_USE_LOOKUP_CONFIG = st.checkbox(
-        "Prefer lookup config table",
-        value=True,
-        help="If the config table exists and contains a matching row, it overrides auto-discovery.",
-    )
-    CFG_LOOKUP_CONFIG_FQN = st.text_input(
-        "Lookup config table",
-        value=DEFAULT_LOOKUP_CONFIG_FQN,
-        help="2-part or 3-part name. Example: EXPORT.PARAM_LOOKUP_CONFIG or MYDB.EXPORT.PARAM_LOOKUP_CONFIG",
-    )
-
-    st.divider()
-    st.subheader("Lookup Performance")
-    CFG_LOOKUP_PAGE_SIZE = st.number_input("Lookup page size", min_value=25, max_value=5000, value=250, step=25)
-    CFG_LOOKUP_DISCOVERY_TABLE_LIMIT = st.number_input(
-        "Lookup discovery candidate tables",
-        min_value=50,
-        max_value=1200,
-        value=400,
-        step=25,
-        help="How many candidate tables/views we consider when auto-discovering lookup sources.",
-    )
-
-    st.divider()
-    st.subheader("CALL Behavior")
-    CFG_USE_NAMED_ARGS = st.checkbox("Use named arguments in CALL", value=True)
-
-    st.divider()
-    st.subheader("UI")
-    CFG_HUMANIZE_NAMES = st.checkbox("Humanize identifiers in UI", value=True)
-    CFG_ENABLE_METADATA_OVERLAY = st.checkbox("Enable Export metadata overlay", value=True)
-
-    st.divider()
-    CFG_SHOW_DEBUG = st.checkbox("Show debug tools", value=False)
+    with st.expander("Admin / diagnostics", expanded=False):
+        CFG_SMART_LOOKUPS = st.checkbox("Smart lookups for KEY/ID params", value=CFG_SMART_LOOKUPS)
+        CFG_ENABLE_LIST_LOOKUPS = st.checkbox("Smart lookups for *KEYLIST/*IDLIST params", value=CFG_ENABLE_LIST_LOOKUPS)
+        CFG_SMART_LOOKUPS_FOR_STRING_CODE = st.checkbox("Also try lookups for *CODE params", value=CFG_SMART_LOOKUPS_FOR_STRING_CODE)
+        CFG_ALLOW_NULLS = st.checkbox("Allow NULL for any parameter", value=CFG_ALLOW_NULLS)
+        CFG_EMPTY_TEXT_AS_NULL = st.checkbox("Treat empty text/JSON as NULL", value=CFG_EMPTY_TEXT_AS_NULL)
+        CFG_SHOW_IDS_IN_LOOKUPS = st.checkbox("Show technical IDs in lookup labels", value=CFG_SHOW_IDS_IN_LOOKUPS)
+        CFG_USE_LOOKUP_CONFIG = st.checkbox("Prefer lookup config table", value=CFG_USE_LOOKUP_CONFIG)
+        CFG_LOOKUP_CONFIG_FQN = st.text_input("Lookup config table", value=CFG_LOOKUP_CONFIG_FQN)
+        CFG_LOOKUP_PAGE_SIZE = st.number_input("Lookup page size", min_value=25, max_value=5000, value=CFG_LOOKUP_PAGE_SIZE, step=25)
+        CFG_LOOKUP_DISCOVERY_TABLE_LIMIT = st.number_input("Lookup discovery candidate tables", min_value=50, max_value=1200, value=CFG_LOOKUP_DISCOVERY_TABLE_LIMIT, step=25)
+        CFG_SHOW_DEBUG = st.checkbox("Show debug tools", value=CFG_SHOW_DEBUG)
 
 
 # =========================================================
@@ -392,115 +383,9 @@ def parse_describe_signature_value(sig: str) -> List[Dict[str, Any]]:
     return params
 
 
-def is_numeric(dtype: str) -> bool:
-    d = (dtype or "").upper()
-    return any(
-        x in d
-        for x in [
-            "NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT", "SMALLINT",
-            "TINYINT", "BYTEINT", "FLOAT", "DOUBLE", "REAL"
-        ]
-    )
-
-
-def is_bool(dtype: str) -> bool:
-    d = (dtype or "").upper()
-    return "BOOLEAN" in d or d == "BOOL"
-
-
-def is_date(dtype: str) -> bool:
-    return (dtype or "").upper().startswith("DATE")
-
-
-def is_time(dtype: str) -> bool:
-    return (dtype or "").upper().startswith("TIME")
-
-
-def is_timestamp(dtype: str) -> bool:
-    d = (dtype or "").upper()
-    return d.startswith("TIMESTAMP") or d.startswith("DATETIME")
-
-
-def is_variantish(dtype: str) -> bool:
-    d = (dtype or "").upper()
-    return any(x in d for x in ["VARIANT", "OBJECT", "ARRAY"])
-
-
-def is_stringish(dtype: str) -> bool:
-    d = (dtype or "").upper()
-    return any(x in d for x in ["VARCHAR", "CHAR", "TEXT", "STRING"])
-
-
-def sql_literal(value: Any, dtype: str) -> str:
-    """
-    Convert widget values into a Snowflake SQL literal/expression.
-    """
-    dtype_u = (dtype or "").upper()
-
-    if value is None:
-        return "NULL"
-
-    if is_bool(dtype_u):
-        return "TRUE" if bool(value) else "FALSE"
-
-    if is_numeric(dtype_u):
-        return str(value)
-
-    if is_date(dtype_u):
-        if isinstance(value, date):
-            return f"DATE '{value.isoformat()}'"
-        return f"DATE '{esc_sql_str(str(value))}'"
-
-    if is_time(dtype_u):
-        if isinstance(value, time):
-            return f"TIME '{value.strftime('%H:%M:%S')}'"
-        return f"TIME '{esc_sql_str(str(value))}'"
-
-    if is_timestamp(dtype_u):
-        s = str(value)
-        if "LTZ" in dtype_u:
-            return f"TO_TIMESTAMP_LTZ('{esc_sql_str(s)}')"
-        if "TZ" in dtype_u:
-            return f"TO_TIMESTAMP_TZ('{esc_sql_str(s)}')"
-        return f"TO_TIMESTAMP_NTZ('{esc_sql_str(s)}')"
-
-    if is_variantish(dtype_u):
-        s = str(value).strip()
-        if not s:
-            return "NULL"
-        return f"PARSE_JSON('{esc_sql_str(s)}')"
-
-    return f"'{esc_sql_str(str(value))}'"
-
-
 def is_generic_arg_name(name: str) -> bool:
     n = (name or "").strip().upper()
     return bool(re.match(r"^(ARG|P)\d+$", n))
-
-
-def humanize_identifier(s: str) -> str:
-    """
-    Best-effort humanization for UI labels.
-    - underscores => spaces + Title Case
-    - suffix KEY/ID/CODE => split
-    """
-    raw = (s or "").strip().strip('"')
-    if not raw:
-        return ""
-
-    up = raw.upper()
-
-    if "_" in raw:
-        parts = [p for p in re.split(r"_+", raw) if p]
-        return " ".join([p[:1].upper() + p[1:].lower() if p.isalpha() else p for p in parts])
-
-    for suf in ("KEY", "ID", "CODE"):
-        if up.endswith(suf) and len(raw) > len(suf):
-            base = raw[: -len(suf)]
-            base_h = base[:1].upper() + base[1:].lower()
-            return f"{base_h} {suf.title()}"
-
-    return raw[:1].upper() + raw[1:].lower()
 
 
 def uniq_keep_order(values: List[str]) -> List[str]:
@@ -1163,7 +1048,7 @@ def lookup_search_options(
         sql = apply_where_clause(base_select, idc, lbl, det, where_clause, search) + f"""
         QUALIFY ROW_NUMBER() OVER (PARTITION BY {idc} ORDER BY TO_VARCHAR({lbl}), TO_VARCHAR({idc})) = 1
         ORDER BY LABEL, TO_VARCHAR(ID)
-        LIMIT {lim} OFFSET {off}
+        LIMIT {lim + 1} OFFSET {off}
         """
     else:
         base_select = f"""
@@ -1176,7 +1061,7 @@ def lookup_search_options(
         sql = apply_where_clause(base_select, idc, lbl, None, where_clause, search) + f"""
         QUALIFY ROW_NUMBER() OVER (PARTITION BY {idc} ORDER BY TO_VARCHAR({lbl}), TO_VARCHAR({idc})) = 1
         ORDER BY LABEL, TO_VARCHAR(ID)
-        LIMIT {lim} OFFSET {off}
+        LIMIT {lim + 1} OFFSET {off}
         """
 
     df = norm_cols(session.sql(sql).to_pandas())
@@ -1188,7 +1073,12 @@ def lookup_search_options(
             df[c] = None
 
     df["LABEL"] = df["LABEL"].fillna(df["ID"].astype(str))
-    return df[["ID", "LABEL", "DETAIL"]].reset_index(drop=True)
+    has_next = len(df) > lim
+    if has_next:
+        df = df.iloc[:lim].copy()
+    out = df[["ID", "LABEL", "DETAIL"]].reset_index(drop=True)
+    out.attrs["has_next"] = has_next
+    return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1606,69 +1496,39 @@ def bool_tri_state_widget(label: str, key: str, help_txt: str) -> Optional[bool]
 # =========================================================
 # Lookup Widget Rendering Helpers
 # =========================================================
-def render_lookup_single(
-    src: Dict[str, Any],
-    widget_base_key: str,
-    help_txt: str,
-) -> Any:
+def bool_tri_state_widget(label: str, key: str, help_txt: str) -> Optional[bool]:
+    options = [None, True, False]
+
+    def _fmt(v):
+        if v is None:
+            return "No value selected"
+        return "True" if v else "False"
+
+    return st.selectbox(label, options=options, format_func=_fmt, key=key, help=help_txt)
+
+
+def _lookup_option_records(opt_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    records = []
+    if opt_df is None or opt_df.empty:
+        return records
+    for _, r in opt_df.iterrows():
+        records.append({
+            'id': r.get('ID'),
+            'label': r.get('LABEL'),
+            'detail': r.get('DETAIL'),
+            'code': r.get('CODE') if 'CODE' in opt_df.columns else None,
+        })
+    return records
+
+
+def render_lookup_single(src: Dict[str, Any], widget_base_key: str, label: str, help_txt: str) -> Tuple[Any, Dict[str, Any], str]:
     search_state_key = f"{widget_base_key}::lkp_search"
     page_state_key = f"{widget_base_key}::lkp_page"
     page_size_state_key = f"{widget_base_key}::lkp_page_size"
     selected_id_key = f"{widget_base_key}::selected_id"
-
-    if search_state_key not in st.session_state:
-        st.session_state[search_state_key] = ""
-    if page_state_key not in st.session_state:
-        st.session_state[page_state_key] = 0
-    if page_size_state_key not in st.session_state:
-        st.session_state[page_size_state_key] = int(CFG_LOOKUP_PAGE_SIZE)
-
-    with st.expander("🔎 Search / Browse options", expanded=False):
-        with st.form(f"{widget_base_key}::search_form", clear_on_submit=False):
-            new_search = st.text_input(
-                "Search (label / detail / id)",
-                value=st.session_state[search_state_key],
-                placeholder="Type and hit Search…",
-            )
-            new_page_size = st.number_input(
-                "Page size",
-                min_value=25,
-                max_value=5000,
-                value=int(st.session_state[page_size_state_key]),
-                step=25,
-            )
-            btns = st.columns([1, 1, 1.6])
-            do_search = btns[0].form_submit_button("Search")
-            do_clear = btns[1].form_submit_button("Clear")
-            _ = btns[2].form_submit_button("Keep")
-
-        if do_search:
-            st.session_state[search_state_key] = new_search.strip()
-            st.session_state[page_state_key] = 0
-            st.session_state[page_size_state_key] = int(new_page_size)
-
-        if do_clear:
-            st.session_state[search_state_key] = ""
-            st.session_state[page_state_key] = 0
-            st.session_state[page_size_state_key] = int(new_page_size)
-
-        nav = st.columns([1, 1, 2.3])
-        if nav[0].button("⬅️ Prev", key=f"{widget_base_key}::prev"):
-            st.session_state[page_state_key] = max(0, int(st.session_state[page_state_key]) - 1)
-        if nav[1].button("➡️ Next", key=f"{widget_base_key}::next"):
-            st.session_state[page_state_key] = int(st.session_state[page_state_key]) + 1
-        nav[2].markdown(
-            (
-                f"<div class='lookup-source'>"
-                f"Source: <b>{src['database']}.{src['schema']}.{src['table']}</b> "
-                f"(ID={src['id_col']}, Label={src['label_col']}"
-                + (f", Detail={src['detail_col']}" if src.get("detail_col") else "")
-                + (f", Filter={src['where_clause']}" if src.get("where_clause") else "")
-                + f") · resolver={src.get('resolver','auto')} · hint={src.get('matched_hint','')}"
-                + f"</div>"
-            ),
-            unsafe_allow_html=True,
-        )
+    st.session_state.setdefault(search_state_key, "")
+    st.session_state.setdefault(page_state_key, 0)
+    st.session_state.setdefault(page_size_state_key, int(CFG_LOOKUP_PAGE_SIZE))
 
     cur_search = str(st.session_state[search_state_key] or "").strip()
     cur_page = int(st.session_state[page_state_key] or 0)
@@ -1676,289 +1536,102 @@ def render_lookup_single(
     cur_offset = cur_page * cur_limit
 
     try:
-        opt_df = lookup_search_options(
-            db=src["database"],
-            schema=src["schema"],
-            table=src["table"],
-            id_col=src["id_col"],
-            label_col=src["label_col"],
-            detail_col=src.get("detail_col"),
-            where_clause=src.get("where_clause"),
-            search=cur_search,
-            limit=cur_limit,
-            offset=cur_offset,
-        )
+        opt_df = lookup_search_options(db=src['database'], schema=src['schema'], table=src['table'], id_col=src['id_col'], label_col=src['label_col'], detail_col=src.get('detail_col'), where_clause=src.get('where_clause'), search=cur_search, limit=cur_limit, offset=cur_offset)
     except Exception:
-        opt_df = pd.DataFrame(columns=["ID", "LABEL", "DETAIL"])
+        opt_df = pd.DataFrame(columns=['ID','LABEL','DETAIL'])
 
-    display_map: Dict[Any, Tuple[str, Optional[str]]] = {}
-    ids: List[Any] = []
-
-    if not opt_df.empty:
-        for _, r in opt_df.iterrows():
-            rid = r.get("ID")
-            rlabel = str(r.get("LABEL") or "")
-            rdetail = r.get("DETAIL")
-            rdetail_s = str(rdetail) if rdetail is not None else None
-            ids.append(rid)
-            display_map[rid] = (rlabel, rdetail_s)
+    has_next = bool(getattr(opt_df, 'attrs', {}).get('has_next', False))
+    option_records = _lookup_option_records(opt_df)
+    label_map = disambiguate_lookup_labels(option_records, show_technical_ids=CFG_SHOW_IDS_IN_LOOKUPS)
+    display_map = {o['id']: label_map[o['id']] for o in option_records}
 
     prior_selected = st.session_state.get(selected_id_key, None)
     if prior_selected is not None and prior_selected not in display_map:
-        fetched = lookup_fetch_one_by_id(
-            db=src["database"],
-            schema=src["schema"],
-            table=src["table"],
-            id_col=src["id_col"],
-            label_col=src["label_col"],
-            detail_col=src.get("detail_col"),
-            where_clause=src.get("where_clause"),
-            id_dtype=src.get("id_dtype"),
-            id_value=prior_selected,
-        )
+        fetched = lookup_fetch_one_by_id(db=src['database'], schema=src['schema'], table=src['table'], id_col=src['id_col'], label_col=src['label_col'], detail_col=src.get('detail_col'), where_clause=src.get('where_clause'), id_dtype=src.get('id_dtype'), id_value=prior_selected)
         if fetched:
             fid, flabel, fdetail = fetched
-            display_map[fid] = (flabel, fdetail)
-            ids = [fid] + ids
+            display_map[fid] = disambiguate_lookup_labels([{'id': fid, 'label': flabel, 'detail': fdetail, 'code': None}], show_technical_ids=CFG_SHOW_IDS_IN_LOOKUPS)[fid]
 
-    seen = set()
-    dedup_ids: List[Any] = []
-    for v in ids:
-        if v not in seen:
-            seen.add(v)
-            dedup_ids.append(v)
+    with st.expander(f"Browse {label}", expanded=False):
+        search_val = st.text_input(f"Search {label}", value=cur_search, key=f"{widget_base_key}::search_input", placeholder="Search name, description, code, or ID", help=help_txt)
+        nav = st.columns([1,1,3])
+        if nav[0].button('⬅️ Prev', key=f"{widget_base_key}::prev", disabled=cur_page == 0):
+            st.session_state[page_state_key] = max(0, cur_page - 1)
+            st.rerun()
+        if nav[1].button('➡️ Next', key=f"{widget_base_key}::next", disabled=not has_next):
+            st.session_state[page_state_key] = cur_page + 1
+            st.rerun()
+        if search_val != cur_search:
+            st.session_state[search_state_key] = search_val.strip()
+            st.session_state[page_state_key] = 0
+            st.rerun()
+        start_row = 0 if not option_records else cur_offset + 1
+        end_row = cur_offset + len(option_records)
+        nav[2].caption(f"Showing {start_row}–{end_row}" if option_records else 'No results on this page')
+        st.caption(f"Source: {src['database']}.{src['schema']}.{src['table']} · resolver={src.get('resolver','auto')}")
 
-    options = [None] + dedup_ids
-
-    def _fmt_id(v):
-        if v is None:
-            return "— Select —"
-        lbl, det = display_map.get(v, (str(v), None))
-        return format_lookup_label(v, lbl, det, CFG_SHOW_IDS_IN_LOOKUPS)
-
-    chosen_id = st.selectbox(
-        "Pick a value",
-        options=options,
-        index=0 if prior_selected is None else (options.index(prior_selected) if prior_selected in options else 0),
-        format_func=_fmt_id,
-        key=f"{widget_base_key}::lkp_select",
-        help=help_txt or "Server-side search + paging (all values accessible).",
-    )
-
+    option_ids = [None] + [o['id'] for o in option_records]
+    chosen_id = st.selectbox(label, options=option_ids, index=0 if prior_selected is None or prior_selected not in option_ids else option_ids.index(prior_selected), format_func=lambda v: '— Select —' if v is None else display_map.get(v, str(v)), key=f"{widget_base_key}::lkp_select", help=help_txt)
     st.session_state[selected_id_key] = chosen_id
-
-    if chosen_id is None and cur_search and opt_df.empty:
-        st.caption("No matches on this page for the current search.")
-    elif cur_search:
-        st.caption(f"Showing page {cur_page + 1} for search: {cur_search}")
-
-    return chosen_id, {
-        "resolver": src.get("resolver"),
-        "matched_hint": src.get("matched_hint"),
-        "source": f"{src['database']}.{src['schema']}.{src['table']}",
-        "search": cur_search,
-        "page": cur_page,
-        "returned": 0 if opt_df.empty else int(len(opt_df)),
-    }
+    selected_display = '' if chosen_id is None else display_map.get(chosen_id, str(chosen_id))
+    if selected_display:
+        st.caption(f"Selected {label}: {selected_display}")
+    return chosen_id, {'resolver': src.get('resolver'), 'matched_hint': src.get('matched_hint'), 'source': f"{src['database']}.{src['schema']}.{src['table']}", 'search': cur_search, 'page': cur_page, 'returned': len(option_records), 'has_next': has_next}, selected_display
 
 
-def render_lookup_multi(
-    src: Dict[str, Any],
-    widget_base_key: str,
-    help_txt: str,
-) -> str:
+def render_lookup_multi(src: Dict[str, Any], widget_base_key: str, label: str, help_txt: str) -> Tuple[str, str]:
+    plural = label if label.endswith('s') else f"{label}s"
     search_state_key = f"{widget_base_key}::lkp_search"
     page_state_key = f"{widget_base_key}::lkp_page"
-    page_size_state_key = f"{widget_base_key}::lkp_page_size"
     selected_ids_key = f"{widget_base_key}::selected_ids"
-    picker_key = f"{widget_base_key}::lkp_picker"
-    remove_key = f"{widget_base_key}::lkp_remove"
-
-    if search_state_key not in st.session_state:
-        st.session_state[search_state_key] = ""
-    if page_state_key not in st.session_state:
-        st.session_state[page_state_key] = 0
-    if page_size_state_key not in st.session_state:
-        st.session_state[page_size_state_key] = int(CFG_LOOKUP_PAGE_SIZE)
-    if selected_ids_key not in st.session_state:
-        st.session_state[selected_ids_key] = []
-
-    with st.expander("🔎 Search / Build list", expanded=False):
-        with st.form(f"{widget_base_key}::search_form", clear_on_submit=False):
-            new_search = st.text_input(
-                "Search (label / detail / id)",
-                value=st.session_state[search_state_key],
-                placeholder="Type and hit Search…",
-            )
-            new_page_size = st.number_input(
-                "Page size",
-                min_value=25,
-                max_value=5000,
-                value=int(st.session_state[page_size_state_key]),
-                step=25,
-            )
-            btns = st.columns([1, 1, 1.6])
-            do_search = btns[0].form_submit_button("Search")
-            do_clear = btns[1].form_submit_button("Clear")
-            _ = btns[2].form_submit_button("Keep")
-
-        if do_search:
-            st.session_state[search_state_key] = new_search.strip()
-            st.session_state[page_state_key] = 0
-            st.session_state[page_size_state_key] = int(new_page_size)
-
-        if do_clear:
-            st.session_state[search_state_key] = ""
-            st.session_state[page_state_key] = 0
-            st.session_state[page_size_state_key] = int(new_page_size)
-
-        nav = st.columns([1, 1, 2.3])
-        if nav[0].button("⬅️ Prev", key=f"{widget_base_key}::prev"):
-            st.session_state[page_state_key] = max(0, int(st.session_state[page_state_key]) - 1)
-        if nav[1].button("➡️ Next", key=f"{widget_base_key}::next"):
-            st.session_state[page_state_key] = int(st.session_state[page_state_key]) + 1
-        nav[2].markdown(
-            (
-                f"<div class='lookup-source'>"
-                f"Source: <b>{src['database']}.{src['schema']}.{src['table']}</b> "
-                f"(ID={src['id_col']}, Label={src['label_col']}"
-                + (f", Detail={src['detail_col']}" if src.get("detail_col") else "")
-                + (f", Filter={src['where_clause']}" if src.get("where_clause") else "")
-                + f") · resolver={src.get('resolver','auto')} · hint={src.get('matched_hint','')}"
-                + f"</div>"
-            ),
-            unsafe_allow_html=True,
-        )
-
-        cur_search = str(st.session_state[search_state_key] or "").strip()
-        cur_page = int(st.session_state[page_state_key] or 0)
-        cur_limit = int(st.session_state[page_size_state_key] or CFG_LOOKUP_PAGE_SIZE)
-        cur_offset = cur_page * cur_limit
-
-        try:
-            opt_df = lookup_search_options(
-                db=src["database"],
-                schema=src["schema"],
-                table=src["table"],
-                id_col=src["id_col"],
-                label_col=src["label_col"],
-                detail_col=src.get("detail_col"),
-                where_clause=src.get("where_clause"),
-                search=cur_search,
-                limit=cur_limit,
-                offset=cur_offset,
-            )
-        except Exception:
-            opt_df = pd.DataFrame(columns=["ID", "LABEL", "DETAIL"])
-
-        display_map: Dict[Any, Tuple[str, Optional[str]]] = {}
-        page_ids: List[Any] = []
-
-        if not opt_df.empty:
-            for _, r in opt_df.iterrows():
-                rid = r.get("ID")
-                rlabel = str(r.get("LABEL") or "")
-                rdetail = r.get("DETAIL")
-                rdetail_s = str(rdetail) if rdetail is not None else None
-                page_ids.append(rid)
-                display_map[rid] = (rlabel, rdetail_s)
-
-        selected_ids = list(st.session_state.get(selected_ids_key, []))
-        missing = tuple(v for v in selected_ids if v not in display_map)
-        if missing:
-            fetched_df = lookup_fetch_many_by_ids(
-                db=src["database"],
-                schema=src["schema"],
-                table=src["table"],
-                id_col=src["id_col"],
-                label_col=src["label_col"],
-                detail_col=src.get("detail_col"),
-                where_clause=src.get("where_clause"),
-                id_dtype=src.get("id_dtype"),
-                id_values=missing,
-            )
-            for _, r in fetched_df.iterrows():
-                rid = r.get("ID")
-                display_map[rid] = (
-                    str(r.get("LABEL") or rid),
-                    str(r.get("DETAIL")) if r.get("DETAIL") is not None else None,
-                )
-
-        options = [None] + uniq_keep_order([str(v) for v in page_ids])
-        page_value_map = {str(v): v for v in page_ids}
-        selected_value = st.selectbox(
-            "Pick a value to add",
-            options=options,
-            format_func=lambda v: "— Select —" if v is None else format_lookup_label(
-                page_value_map[v],
-                display_map.get(page_value_map[v], (v, None))[0],
-                display_map.get(page_value_map[v], (v, None))[1],
-                CFG_SHOW_IDS_IN_LOOKUPS,
-            ),
-            key=picker_key,
-            help=help_txt or "Search, page, and add values into the list.",
-        )
-
-        action_cols = st.columns([1, 1, 1, 2])
-        if action_cols[0].button("➕ Add", key=f"{widget_base_key}::add_one") and selected_value is not None:
-            actual = page_value_map[selected_value]
-            if actual not in selected_ids:
-                selected_ids.append(actual)
-                st.session_state[selected_ids_key] = selected_ids
-
-        if action_cols[1].button("➕ Add page", key=f"{widget_base_key}::add_page"):
-            for actual in page_ids:
-                if actual not in selected_ids:
-                    selected_ids.append(actual)
-            st.session_state[selected_ids_key] = selected_ids
-
-        if action_cols[2].button("🧹 Clear all", key=f"{widget_base_key}::clear_all"):
-            selected_ids = []
-            st.session_state[selected_ids_key] = selected_ids
-
-        if selected_ids:
-            remove_options = [None] + [str(v) for v in selected_ids]
-            remove_map = {str(v): v for v in selected_ids}
-            remove_value = st.selectbox(
-                "Remove one",
-                options=remove_options,
-                format_func=lambda v: "— Select —" if v is None else format_lookup_label(
-                    remove_map[v],
-                    display_map.get(remove_map[v], (v, None))[0],
-                    display_map.get(remove_map[v], (v, None))[1],
-                    CFG_SHOW_IDS_IN_LOOKUPS,
-                ),
-                key=remove_key,
-            )
-            if st.button("➖ Remove", key=f"{widget_base_key}::remove_one") and remove_value is not None:
-                actual = remove_map[remove_value]
-                selected_ids = [x for x in selected_ids if x != actual]
-                st.session_state[selected_ids_key] = selected_ids
-
-            preview_df = lookup_fetch_many_by_ids(
-                db=src["database"],
-                schema=src["schema"],
-                table=src["table"],
-                id_col=src["id_col"],
-                label_col=src["label_col"],
-                detail_col=src.get("detail_col"),
-                where_clause=src.get("where_clause"),
-                id_dtype=src.get("id_dtype"),
-                id_values=tuple(selected_ids),
-            )
-            st.caption(f"Selected {len(selected_ids)} value(s)")
-            if not preview_df.empty:
-                st.dataframe(preview_df, use_container_width=True, height=min(260, 38 * (len(preview_df) + 1)))
-        else:
-            st.caption("No values selected yet.")
-
+    st.session_state.setdefault(search_state_key, '')
+    st.session_state.setdefault(page_state_key, 0)
+    st.session_state.setdefault(selected_ids_key, [])
+    cur_search = str(st.session_state[search_state_key] or '').strip()
+    cur_page = int(st.session_state[page_state_key] or 0)
+    cur_limit = int(CFG_LOOKUP_PAGE_SIZE)
+    cur_offset = cur_page * cur_limit
+    try:
+        opt_df = lookup_search_options(db=src['database'], schema=src['schema'], table=src['table'], id_col=src['id_col'], label_col=src['label_col'], detail_col=src.get('detail_col'), where_clause=src.get('where_clause'), search=cur_search, limit=cur_limit, offset=cur_offset)
+    except Exception:
+        opt_df = pd.DataFrame(columns=['ID','LABEL','DETAIL'])
+    has_next = bool(getattr(opt_df, 'attrs', {}).get('has_next', False))
+    option_records = _lookup_option_records(opt_df)
+    label_map = disambiguate_lookup_labels(option_records, show_technical_ids=CFG_SHOW_IDS_IN_LOOKUPS)
+    display_map = {o['id']: label_map[o['id']] for o in option_records}
     selected_ids = list(st.session_state.get(selected_ids_key, []))
-    if selected_ids:
-        csv_value = ",".join([str(v) for v in selected_ids])
-        st.caption(f"Selected {len(selected_ids)} value(s) for this parameter.")
-        return csv_value
+    with st.expander(f"Browse {plural}", expanded=False):
+        search_val = st.text_input(f"Search {plural}", value=cur_search, key=f"{widget_base_key}::search_input", placeholder="Search name, description, code, or ID")
+        nav = st.columns([1,1,3])
+        if nav[0].button('⬅️ Prev', key=f"{widget_base_key}::prev", disabled=cur_page == 0):
+            st.session_state[page_state_key] = max(0, cur_page - 1)
+            st.rerun()
+        if nav[1].button('➡️ Next', key=f"{widget_base_key}::next", disabled=not has_next):
+            st.session_state[page_state_key] = cur_page + 1
+            st.rerun()
+        if search_val != cur_search:
+            st.session_state[search_state_key] = search_val.strip()
+            st.session_state[page_state_key] = 0
+            st.rerun()
+        nav[2].caption(f"Showing {cur_offset + 1 if option_records else 0}–{cur_offset + len(option_records)}")
 
-    return ""
+    add_choice = st.selectbox(f"Add {plural}", options=[None] + [o['id'] for o in option_records], format_func=lambda v: '— Select —' if v is None else display_map.get(v, str(v)), key=f"{widget_base_key}::lkp_picker", help=help_txt)
+    action_cols = st.columns([1,1,2])
+    if action_cols[0].button('➕ Add', key=f"{widget_base_key}::add_one") and add_choice is not None and add_choice not in selected_ids:
+        selected_ids.append(add_choice)
+        st.session_state[selected_ids_key] = selected_ids
+        st.rerun()
+    if action_cols[1].button('🧹 Clear', key=f"{widget_base_key}::clear_all"):
+        st.session_state[selected_ids_key] = []
+        st.rerun()
+    summary = ', '.join(display_map.get(v, str(v)) for v in selected_ids)
+    st.caption(f"Selected {plural}: {summary}" if selected_ids else f"Selected {plural}: none")
+    if selected_ids:
+        remove_choice = st.selectbox(f"Remove {label}", options=[None] + selected_ids, format_func=lambda v: '— Select —' if v is None else display_map.get(v, str(v)), key=f"{widget_base_key}::lkp_remove")
+        if st.button('➖ Remove', key=f"{widget_base_key}::remove_one") and remove_choice is not None:
+            st.session_state[selected_ids_key] = [x for x in selected_ids if x != remove_choice]
+            st.rerun()
+    return ','.join(str(v) for v in st.session_state.get(selected_ids_key, [])), summary
 
 
 # =========================================================
@@ -1976,7 +1649,7 @@ def push_history(entry: Dict[str, Any]) -> None:
 # =========================================================
 # UI: Tabs
 # =========================================================
-tab_report, tab_history, tab_debug = st.tabs(["📋 Report Builder", "🕒 Run History", "🛠️ Debug"])
+tab_report, tab_history, tab_debug = st.tabs(["Run Report", "Recent Runs", "Diagnostics"])
 
 
 # =========================================================
@@ -1989,505 +1662,252 @@ with tab_report:
         st.stop()
 
     db_map_comment = {r["NAME"]: r.get("COMMENT", "") for _, r in db_df.iterrows()}
-    db_options = db_df["NAME"].astype(str).tolist()
-
-    def _fmt_db(n: str) -> str:
-        c = (db_map_comment.get(n) or "").strip()
-        return f"{n} — {c}" if c else n
-
-    sel_row_1 = st.columns([1.2, 1.2, 2.2], gap="large")
-
-    with sel_row_1[0]:
-        db = st.selectbox("Database", options=db_options, format_func=_fmt_db, key="db_select")
-
+    db = st.selectbox("Database", options=db_df["NAME"].astype(str).tolist(), format_func=lambda n: f"{n} — {db_map_comment.get(n,'').strip()}" if (db_map_comment.get(n) or '').strip() else n, key='db_select')
     schema_df = get_schemas_df(db)
     if schema_df.empty:
         st.error("No schemas visible in this database (or insufficient privileges).")
         st.stop()
-
     sch_map_comment = {r["NAME"]: r.get("COMMENT", "") for _, r in schema_df.iterrows()}
-    schema_options = schema_df["NAME"].astype(str).tolist()
-
-    def _fmt_schema(n: str) -> str:
-        c = (sch_map_comment.get(n) or "").strip()
-        return f"{n} — {c}" if c else n
-
-    with sel_row_1[1]:
-        schema = st.selectbox("Schema", options=schema_options, format_func=_fmt_schema, key="schema_select")
+    schema = st.selectbox("Schema", options=schema_df["NAME"].astype(str).tolist(), format_func=lambda n: f"{n} — {sch_map_comment.get(n,'').strip()}" if (sch_map_comment.get(n) or '').strip() else n, key='schema_select')
 
     procs_df = get_procedures_df(db, schema)
     if procs_df.empty:
         st.warning("No procedures found in this schema.")
         st.stop()
 
-    with sel_row_1[2]:
-        proc_search = st.text_input(
-            "Search procedures",
-            value="",
-            placeholder="Type to filter by name / comment…",
-            key="proc_search",
-        )
+    proc_search = st.text_input('Search reports', value='', placeholder='Search by report name, description, comment, procedure, or schema', key='proc_search')
+    meta_candidates = find_export_metadata_tables(db) if CFG_ENABLE_METADATA_OVERLAY else []
+    export_row_by_proc = {}
+    export_params_rows: List[Dict[str, Any]] = []
+    chosen_report_code = ''
+    if meta_candidates:
+        picked = meta_candidates[0]
+        reports_df = get_export_reports(db, picked['schema'], picked['table'])
+        if not reports_df.empty and 'EXPORTREPORTCODE' in reports_df.columns:
+            report_options = [f"{str(r.get('EXPORTREPORTNAME') or r.get('EXPORTREPORTCODE') or '').strip()} — {str(r.get('EXPORTREPORTCODE') or '').strip()}" for _, r in reports_df.iterrows()]
+            chosen_report_label = st.selectbox('Report metadata', options=['(None)'] + report_options, key='report_pick')
+            if chosen_report_label != '(None)':
+                chosen_report_row = reports_df.iloc[report_options.index(chosen_report_label)]
+                chosen_report_code = str(chosen_report_row.get('EXPORTREPORTCODE') or '').strip()
+                export_row_by_proc = {str(r.get('NAME') or '').upper(): chosen_report_row.to_dict() for _, r in procs_df.iterrows()}
+                export_params_df = get_export_params_for_report(db, picked['schema'], picked['table'], chosen_report_code)
+                export_params_rows = export_params_df.to_dict('records') if not export_params_df.empty else []
 
-        fdf = procs_df.copy()
-        if proc_search.strip():
-            s = proc_search.strip().lower()
-            fdf = fdf[
-                fdf["DISPLAY"].astype(str).str.lower().str.contains(re.escape(s), na=False)
-                | fdf["NAME"].astype(str).str.lower().str.contains(re.escape(s), na=False)
-            ].copy()
+    proc_options = []
+    for _, row in procs_df.iterrows():
+        proc_name = str(row.get('NAME') or '').strip()
+        type_sig = signature_types_only(first_paren_group(str(row.get('ARGUMENTS') or '()')))
+        proc_meta = resolve_proc_ui_meta(db, schema, proc_name, type_sig, proc_comment=str(row.get('COMMENT') or ''), export_row=export_row_by_proc.get(proc_name.upper()))
+        display = proc_meta.display_name
+        if str(row.get('COMMENT') or '').strip() and display != str(row.get('COMMENT') or '').strip():
+            display = f"{display} — {str(row.get('COMMENT') or '').strip()}"
+        proc_options.append((str(row['PROC_ID']), display, proc_meta))
+    if proc_search.strip():
+        search = proc_search.strip().lower()
+        proc_options = [p for p in proc_options if search in p[1].lower() or search in p[2].proc_name.lower() or search in p[2].schema.lower()]
+    if not proc_options:
+        st.info('No reports match your search.')
+        st.stop()
+    selected_proc_id = st.selectbox('Report', options=[p[0] for p in proc_options], format_func=lambda pid: next(x[1] for x in proc_options if x[0] == pid), key='proc_select')
+    proc_row = procs_df[procs_df['PROC_ID'] == selected_proc_id].iloc[0]
+    proc_name = str(proc_row.get('NAME') or '').strip()
+    raw_args = str(proc_row.get('ARGUMENTS') or '').strip()
+    proc_comment = str(proc_row.get('COMMENT') or '').strip()
+    proc_created_on = str(proc_row.get('CREATED_ON') or '').strip()
+    type_sig = signature_types_only(first_paren_group(raw_args))
+    proc_meta = next(x[2] for x in proc_options if x[0] == selected_proc_id)
+    proc_key = proc_instance_key(db, schema, proc_name, type_sig)
 
-        if fdf.empty:
-            st.info("No procedures match your search.")
-            st.stop()
+    st.header(proc_meta.display_name)
+    st.caption(proc_meta.description or proc_comment or 'Run the selected report with business-friendly parameters.')
+    with st.expander('Technical details', expanded=False):
+        st.code(f'{db}.{schema}.{proc_name}{type_sig}')
+        st.caption(f'Created: {proc_created_on or "—"}')
 
-        proc_id_options = fdf["PROC_ID"].astype(str).tolist()
-        disp_map = {r["PROC_ID"]: r["DISPLAY"] for _, r in fdf.iterrows()}
+    params = harvest_params(db, schema, proc_name, type_sig) or []
+    meta_mapping = match_export_metadata(params, export_params_rows) if export_params_rows else {}
+    ui_params = [resolve_param_ui_meta(proc_meta, p, idx, overlay_row=meta_mapping.get(str(p.get('name') or f'ARG{idx}')), allow_null=CFG_ALLOW_NULLS) for idx, p in enumerate(params, start=1)]
+    validation_errors: Dict[str, str] = {}
+    submissions: List[Tuple[str, ParamSubmission]] = []
+    submission_display: List[str] = []
+    lookup_debug_rows = []
 
-        def _fmt_proc(pid: str) -> str:
-            return disp_map.get(pid, pid)
+    for p, ui_meta in zip(params, ui_params):
+        real_name = ui_meta.param_name
+        ptype = (p.get('type') or '').upper().strip()
+        widget_base_key = f'param::{proc_key}::{real_name}'
+        st.markdown(f"**{ui_meta.display_label}**  \n<span class='small-muted'>{real_name} · {ptype}</span>", unsafe_allow_html=True)
+        badges = []
+        if ui_meta.default_mode == 'proc_default':
+            badges.append('Uses procedure default')
+        if ui_meta.allow_null:
+            badges.append('NULL allowed')
+        if ui_meta.required:
+            badges.append('Required')
+        if badges:
+            st.caption(' · '.join(badges))
+        if ui_meta.help_text:
+            st.caption(ui_meta.help_text)
 
-        selected_proc_id = st.selectbox("Procedure", options=proc_id_options, format_func=_fmt_proc, key="proc_select")
+        mode_options = ['Set value']
+        if ui_meta.default_mode == 'proc_default':
+            mode_options = ['Use procedure default', 'Set value']
+        if ui_meta.allow_null:
+            mode_options.append('Pass NULL')
+        mode_label = st.radio(f"{ui_meta.display_label} mode", options=mode_options, horizontal=True, key=f"{widget_base_key}::mode", label_visibility='collapsed')
+        mode = 'DEFAULT' if mode_label == 'Use procedure default' else ('NULL' if mode_label == 'Pass NULL' else 'VALUE')
+        raw_value = None
+        display_value = ''
+        lookup_name = ui_meta.lookup_key or normalize_name(real_name)
+        use_scalar_lookup = CFG_SMART_LOOKUPS and is_lookup_scalar_param(lookup_name, ptype, CFG_SMART_LOOKUPS_FOR_STRING_CODE)
+        use_list_lookup = CFG_ENABLE_LIST_LOOKUPS and is_lookup_list_param(lookup_name, ptype, CFG_SMART_LOOKUPS_FOR_STRING_CODE)
 
-    proc_row = procs_df[procs_df["PROC_ID"] == selected_proc_id].iloc[0]
-    proc_name = str(proc_row.get("NAME") or "").strip()
-    raw_args = str(proc_row.get("ARGUMENTS") or "").strip()
-    proc_comment = str(proc_row.get("COMMENT") or "").strip()
-    proc_created_on = str(proc_row.get("CREATED_ON") or "").strip()
+        if mode == 'VALUE':
+            src = None
+            if use_scalar_lookup or use_list_lookup:
+                discovered = discover_best_lookup_source(db=db, param_name=lookup_name, cand_limit=int(CFG_LOOKUP_DISCOVERY_TABLE_LIMIT), use_lookup_config=bool(CFG_USE_LOOKUP_CONFIG), config_fqn=CFG_LOOKUP_CONFIG_FQN)
+                lkp_meta = resolve_lookup_ui_meta(proc_meta, ui_meta, real_name, config_match=discovered if discovered and discovered.get('resolver') == 'config' else None, discovered_match=discovered)
+                src = discovered if lkp_meta else None
+            if src and use_list_lookup:
+                raw_value, display_value = render_lookup_multi(src, widget_base_key, ui_meta.display_label, ui_meta.help_text)
+            elif src:
+                raw_value, dbg, display_value = render_lookup_single(src, widget_base_key, ui_meta.display_label, ui_meta.help_text)
+                lookup_debug_rows.append({'Param': real_name, 'Label': ui_meta.display_label, **dbg})
+            elif is_bool(ptype):
+                raw_value = bool_tri_state_widget(ui_meta.display_label, key=f"{widget_base_key}::bool", help_txt=ui_meta.help_text)
+                display_value = '' if raw_value is None else str(raw_value)
+            elif is_numeric(ptype):
+                raw_value = st.text_input(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::num", ''), key=f"{widget_base_key}::num", placeholder='Enter a number')
+                display_value = str(raw_value).strip()
+                if display_value == '':
+                    mode = 'UNSET'
+                else:
+                    raw_value = float(display_value) if '.' in display_value else int(display_value)
+            elif is_date(ptype):
+                raw_value = st.text_input(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::date", ''), key=f"{widget_base_key}::date", placeholder='YYYY-MM-DD')
+                display_value = str(raw_value).strip()
+                if display_value == '':
+                    mode = 'UNSET'
+            elif is_time(ptype):
+                raw_value = st.text_input(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::time", ''), key=f"{widget_base_key}::time", placeholder='HH:MM:SS')
+                display_value = str(raw_value).strip()
+                if display_value == '':
+                    mode = 'UNSET'
+            elif is_timestamp(ptype):
+                raw_value = st.text_input(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::ts", ''), key=f"{widget_base_key}::ts", placeholder='YYYY-MM-DD HH:MM:SS')
+                display_value = str(raw_value).strip()
+                if display_value == '':
+                    mode = 'UNSET'
+            elif is_variantish(ptype):
+                raw_value = st.text_area(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::json", ''), key=f"{widget_base_key}::json", placeholder='{"key":"value"}')
+                display_value = str(raw_value).strip()
+                if display_value == '':
+                    mode = 'UNSET'
+            else:
+                raw_value = st.text_input(ui_meta.display_label, value=st.session_state.get(f"{widget_base_key}::txt", ''), key=f"{widget_base_key}::txt", placeholder=ui_meta.placeholder or f'Enter {ui_meta.display_label.lower()}')
+                display_value = str(raw_value).strip()
+                if display_value == '' and ui_meta.required:
+                    mode = 'UNSET'
 
-    paren = first_paren_group(raw_args)
-    type_sig = signature_types_only(paren)
-
-    st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
-
-    meta_cols = st.columns([2.0, 1.2, 1.2, 1.8], gap="large")
-    with meta_cols[0]:
-        st.subheader("Selected report")
-        st.write(f"**{db}.{schema}.{proc_name}**")
-        if proc_comment:
-            st.caption(proc_comment)
-        else:
-            st.caption("No comment on this procedure.")
-
-    with meta_cols[1]:
-        st.subheader("Signature")
-        st.code(type_sig)
-
-    with meta_cols[2]:
-        st.subheader("Created")
-        st.write(proc_created_on if proc_created_on else "—")
-
-    with meta_cols[3]:
-        st.subheader("Lookup mode")
-        lookup_cfg_status = lookup_config_status(db, CFG_LOOKUP_CONFIG_FQN)
-        if CFG_USE_LOOKUP_CONFIG and lookup_cfg_status.get("exists"):
-            st.caption(
-                f"Config active: {lookup_cfg_status['db']}.{lookup_cfg_status['schema']}.{lookup_cfg_status['table']}"
-            )
-        elif CFG_USE_LOOKUP_CONFIG:
-            st.caption("Config not found. Auto-discovery fallback is active.")
-        else:
-            st.caption("Auto-discovery only.")
-
-    st.markdown("### Parameters")
+        submission = build_param_submission(mode, raw_value, ptype, display_value=display_value)
+        if submission.mode == 'VALUE' and is_variantish(ptype) and raw_value not in (None, ''):
+            json_err = validate_variant_json(raw_value)
+            if json_err:
+                submission = ParamSubmission(submission.mode, raw_value, None, display_value, False, json_err)
+        if submission.mode == 'VALUE' and is_timestamp(ptype) and raw_value not in (None, '') and submission.sql_literal is None:
+            submission = ParamSubmission(submission.mode, raw_value, None, display_value, False, 'Invalid timestamp value.')
+        if submission.mode == 'UNSET' and not ui_meta.required and ui_meta.default_mode == 'proc_default':
+            submission = build_param_submission('DEFAULT', None, ptype, display_value='Use procedure default')
+        if not submission.is_valid:
+            validation_errors[real_name] = submission.validation_error
+            st.error(f"{ui_meta.display_label}: {submission.validation_error}")
+        elif submission.display_value:
+            submission_display.append(f"{ui_meta.display_label}: {submission.display_value}")
+        submissions.append((real_name, submission))
+        st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
 
     try:
-        params = harvest_params(db, schema, proc_name, type_sig)
-    except Exception as e:
-        st.error("Could not harvest parameters for this procedure.")
-        st.code(str(e))
-        st.stop()
+        call_sql = build_call_sql(db, schema, proc_name, submissions, named_args=True)
+    except Exception as exc:
+        call_sql = f'-- invalid call: {exc}'
+        validation_errors['call_sql'] = str(exc)
 
-    if params is None:
-        params = []
-
-    friendly_overlay: Dict[str, Dict[str, str]] = {}
-    overlay_active = False
-    generic_names = bool(params) and all(is_generic_arg_name(p.get("name", "")) for p in params)
-
-    if CFG_ENABLE_METADATA_OVERLAY:
-        with st.expander("✨ Optional: Friendly labels (Export metadata overlay)", expanded=generic_names):
-            st.caption(
-                "If Snowflake exposes ARG1/ARG2, overlay friendly labels/prompts from an Export metadata table. "
-                "This does NOT change the real CALL — it only upgrades the UI."
-            )
-
-            meta_candidates = find_export_metadata_tables(db)
-            if not meta_candidates:
-                st.info("No candidate metadata tables detected (or insufficient privileges).")
-            else:
-                options = [f'{c["schema"]}.{c["table"]}  (score={c["score"]})' for c in meta_candidates]
-                pick = st.selectbox("Metadata table", options, index=0, key="meta_table_pick")
-
-                picked = meta_candidates[options.index(pick)]
-                meta_schema = picked["schema"]
-                meta_table = picked["table"]
-
-                reports_df = get_export_reports(db, meta_schema, meta_table)
-                if reports_df.empty or "EXPORTREPORTCODE" not in reports_df.columns:
-                    st.warning("Could not read ExportReportCode/ExportReportName from that table.")
-                else:
-                    def _rlabel(r):
-                        code = str(r.get("EXPORTREPORTCODE") or "").strip()
-                        name = str(r.get("EXPORTREPORTNAME") or "").strip()
-                        return f"{code} — {name}" if name else code
-
-                    report_labels = [_rlabel(r) for _, r in reports_df.iterrows()]
-                    chosen_label = st.selectbox("Report", report_labels, key="report_pick")
-                    chosen_row = reports_df.iloc[report_labels.index(chosen_label)]
-                    report_code = str(chosen_row.get("EXPORTREPORTCODE") or "").strip()
-
-                    meta_params_df = get_export_params_for_report(db, meta_schema, meta_table, report_code)
-
-                    if meta_params_df.empty:
-                        st.warning("No parameters found for that report code in the metadata table.")
-                    else:
-                        overlay_active = st.checkbox("Apply overlay to input labels", value=True, key="apply_overlay")
-                        if overlay_active:
-                            mp = meta_params_df.copy()
-
-                            def _friendly_from_row(r):
-                                tok = str(r.get("EXPORTPARAMTOKEN") or "").strip()
-                                nm = str(r.get("EXPORTPARAMNAME") or "").strip()
-                                if tok.startswith("@"):
-                                    return tok[1:].strip()
-                                if tok:
-                                    return tok
-                                return nm or ""
-
-                            mp["FRIENDLY"] = mp.apply(_friendly_from_row, axis=1)
-                            mp["PROMPT"] = mp.get("EXPORTPARAMPROMPT", "")
-
-                            overlay_list = mp.to_dict("records")
-                            friendly_overlay = {}
-
-                            for i, p in enumerate(params):
-                                if i < len(overlay_list):
-                                    real = p["name"]
-                                    friendly_overlay[real] = {
-                                        "label": overlay_list[i].get("FRIENDLY") or real,
-                                        "prompt": overlay_list[i].get("PROMPT") or "",
-                                        "token": overlay_list[i].get("EXPORTPARAMTOKEN") or "",
-                                        "meta_name": overlay_list[i].get("EXPORTPARAMNAME") or "",
-                                    }
-
-                            if friendly_overlay:
-                                preview = []
-                                for p in params:
-                                    real = p["name"]
-                                    ov = friendly_overlay.get(real, {})
-                                    preview.append(
-                                        {
-                                            "Real Parameter": real,
-                                            "UI Label": ov.get("label", real),
-                                            "Prompt": ov.get("prompt", ""),
-                                            "Token": ov.get("token", ""),
-                                        }
-                                    )
-                                st.dataframe(pd.DataFrame(preview), use_container_width=True)
-
-    user_inputs: Dict[str, Any] = {}
-    lookup_debug_rows: List[Dict[str, Any]] = []
-
-    if not params:
-        st.info("This procedure has no parameters.")
+    st.markdown('### Run summary')
+    if submission_display:
+        for line in submission_display:
+            st.write(f'• {line}')
     else:
-        cols = st.columns(2, gap="large")
+        st.caption('No parameter values selected yet.')
+    with st.expander('Generated CALL SQL', expanded=False):
+        st.code(call_sql)
 
-        for idx, p in enumerate(params, start=1):
-            real_name = p.get("name", f"ARG{idx}")
-            ptype = (p.get("type") or "").upper().strip()
-            pdefault = (p.get("default") or "").strip() if p.get("default") else ""
-
-            label, help_txt = safe_param_label(real_name, overlay_active, friendly_overlay)
-            if pdefault:
-                help_txt = (help_txt + "\n\n" if help_txt else "") + f"Default (from signature): {pdefault}"
-
-            widget_base_key = f"param::{db}::{schema}::{proc_name}::{real_name}"
-            target_col = cols[(idx - 1) % 2]
-
-            with target_col:
-                st.markdown(f"**{label}**  \n<span class='small-muted'>{ptype}</span>", unsafe_allow_html=True)
-
-                is_null = False
-                if CFG_ALLOW_NULLS:
-                    is_null = st.checkbox("NULL", key=f"{widget_base_key}::null", help="Pass NULL to the procedure")
-
-                if is_null:
-                    user_inputs[real_name] = None
-                    st.caption(help_txt or "Passing NULL.")
-                    st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
-                    continue
-
-                lookup_name = id_hint_for_param(real_name, overlay_active, friendly_overlay)
-                use_scalar_lookup = CFG_SMART_LOOKUPS and is_lookup_scalar_param(lookup_name, ptype, CFG_SMART_LOOKUPS_FOR_STRING_CODE)
-                use_list_lookup = CFG_ENABLE_LIST_LOOKUPS and is_lookup_list_param(lookup_name, ptype, CFG_SMART_LOOKUPS_FOR_STRING_CODE)
-
-                if use_scalar_lookup or use_list_lookup:
-                    src = discover_best_lookup_source(
-                        db=db,
-                        param_name=lookup_name,
-                        cand_limit=int(CFG_LOOKUP_DISCOVERY_TABLE_LIMIT),
-                        use_lookup_config=bool(CFG_USE_LOOKUP_CONFIG),
-                        config_fqn=CFG_LOOKUP_CONFIG_FQN,
-                    )
-
-                    if src:
-                        if use_list_lookup:
-                            chosen_csv = render_lookup_multi(src=src, widget_base_key=widget_base_key, help_txt=help_txt)
-                            user_inputs[real_name] = chosen_csv
-                            lookup_debug_rows.append(
-                                {
-                                    "Param": real_name,
-                                    "Lookup Name": lookup_name,
-                                    "Mode": "multi",
-                                    "Source": f"{src['database']}.{src['schema']}.{src['table']}",
-                                    "Resolver": src.get("resolver", ""),
-                                    "Hint": src.get("matched_hint", ""),
-                                    "Score": src.get("score", ""),
-                                    "Where": src.get("where_clause", "") or "",
-                                }
-                            )
-                            if help_txt:
-                                st.caption(help_txt)
-                            st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
-                            continue
-
-                        chosen_value, dbg = render_lookup_single(src=src, widget_base_key=widget_base_key, help_txt=help_txt)
-                        user_inputs[real_name] = chosen_value
-                        lookup_debug_rows.append(
-                            {
-                                "Param": real_name,
-                                "Lookup Name": lookup_name,
-                                "Mode": "single",
-                                "Source": dbg.get("source", ""),
-                                "Resolver": dbg.get("resolver", ""),
-                                "Hint": dbg.get("matched_hint", ""),
-                                "Search": dbg.get("search", ""),
-                                "Page": dbg.get("page", ""),
-                                "Returned": dbg.get("returned", ""),
-                                "Score": src.get("score", ""),
-                                "Where": src.get("where_clause", "") or "",
-                            }
-                        )
-                        if help_txt:
-                            st.caption(help_txt)
-                        st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
-                        continue
-
-                    lookup_debug_rows.append(
-                        {
-                            "Param": real_name,
-                            "Lookup Name": lookup_name,
-                            "Mode": "single" if use_scalar_lookup else "multi",
-                            "Source": "(none found)",
-                            "Resolver": "",
-                            "Hint": ", ".join(generate_lookup_hints(lookup_name)[:5]),
-                            "Score": "",
-                            "Where": "",
-                        }
-                    )
-
-                # ---- Fallback widgets
-                if is_bool(ptype) and CFG_ALLOW_NULLS:
-                    user_inputs[real_name] = bool_tri_state_widget("Value", key=f"{widget_base_key}::bool", help_txt=help_txt)
-
-                elif is_bool(ptype):
-                    user_inputs[real_name] = st.checkbox("Value", value=False, help=help_txt, key=f"{widget_base_key}::bool2")
-
-                elif is_numeric(ptype):
-                    user_inputs[real_name] = st.number_input(
-                        "Value",
-                        value=0,
-                        step=1,
-                        help=help_txt,
-                        key=f"{widget_base_key}::num",
-                    )
-
-                elif is_date(ptype):
-                    user_inputs[real_name] = st.date_input(
-                        "Value",
-                        value=date.today(),
-                        help=help_txt,
-                        key=f"{widget_base_key}::date",
-                    )
-
-                elif is_time(ptype):
-                    user_inputs[real_name] = st.time_input(
-                        "Value",
-                        value=time(0, 0, 0),
-                        help=help_txt,
-                        key=f"{widget_base_key}::time",
-                    )
-
-                elif is_timestamp(ptype):
-                    user_inputs[real_name] = st.text_input(
-                        "Value",
-                        value="",
-                        help=help_txt or "Enter timestamp string (e.g., 2025-01-31 13:45:00).",
-                        key=f"{widget_base_key}::ts",
-                        placeholder="YYYY-MM-DD HH:MM:SS",
-                    )
-
-                elif is_variantish(ptype):
-                    user_inputs[real_name] = st.text_area(
-                        "Value (JSON)",
-                        value="",
-                        help=help_txt or "Enter JSON (passed via PARSE_JSON('...')).",
-                        key=f"{widget_base_key}::json",
-                        height=110,
-                        placeholder='{"key":"value"}',
-                    )
-
-                else:
-                    user_inputs[real_name] = st.text_input(
-                        "Value",
-                        value="",
-                        help=help_txt,
-                        key=f"{widget_base_key}::txt",
-                    )
-
-                st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
-
-    fq = f"{qident(db)}.{qident(schema)}.{qident(proc_name)}"
-    arg_exprs: List[str] = []
-    arg_values_positional: List[str] = []
-
-    for i, p in enumerate(params, start=1):
-        real_name = p.get("name", f"ARG{i}")
-        ptype = (p.get("type") or "").upper().strip()
-        val = user_inputs.get(real_name)
-
-        if CFG_EMPTY_TEXT_AS_NULL and val is not None and isinstance(val, str) and val.strip() == "" and (
-            is_stringish(ptype) or is_variantish(ptype) or is_timestamp(ptype)
-        ):
-            val = None
-
-        lit = sql_literal(val, ptype)
-        arg_values_positional.append(lit)
-
-        if CFG_USE_NAMED_ARGS:
-            if re.match(r"^[A-Z_][A-Z0-9_\$]*$", real_name.upper()):
-                arg_exprs.append(f"{real_name} => {lit}")
-            else:
-                arg_exprs.append(f"{qident(real_name)} => {lit}")
-
-    if CFG_USE_NAMED_ARGS:
-        call_sql = f"CALL {fq}({', '.join(arg_exprs)});"
-    else:
-        call_sql = f"CALL {fq}({', '.join(arg_values_positional)});"
-
-    with st.expander("🧾 Generated CALL SQL", expanded=False):
-        if overlay_active and friendly_overlay:
-            mapping_lines = []
-            for p in params:
-                real = p["name"]
-                ui = friendly_overlay.get(real, {}).get("label", "")
-                if ui and ui != real:
-                    mapping_lines.append(f"-- {ui} maps to {real}")
-            if mapping_lines:
-                st.code("\n".join(mapping_lines) + "\n" + call_sql)
-            else:
-                st.code(call_sql)
-        else:
-            st.code(call_sql)
-
-    run_row = st.columns([1.2, 1.0, 6.0], gap="large")
-    with run_row[0]:
-        run_clicked = st.button("🚀 Run report", type="primary")
-    with run_row[1]:
-        clear_clicked = st.button("🧹 Clear inputs")
-    with run_row[2]:
-        st.caption("Runs only when you click **Run report** — changing inputs won’t execute anything.")
+    run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions)
+    if validation_errors:
+        st.warning('Fix the parameter errors below before running the report.')
+    run_row = st.columns([1.2,1.2,4])
+    run_clicked = run_row[0].button('🚀 Run report', type='primary', disabled=run_disabled)
+    clear_clicked = run_row[1].button('🧹 Clear inputs')
+    run_row[2].caption('The report runs only after you click Run report.')
 
     if clear_clicked:
-        keys_to_clear = [k for k in st.session_state.keys() if k.startswith(f"param::{db}::{schema}::{proc_name}::")]
+        keys_to_clear = [k for k in list(st.session_state.keys()) if k.startswith(f'param::{proc_key}::')]
         for k in keys_to_clear:
-            try:
-                del st.session_state[k]
-            except Exception:
-                pass
-        st.success("Cleared inputs for this procedure. Scroll up; the UI will refresh.")
+            del st.session_state[k]
+        st.success('Cleared inputs for this report.')
         st.stop()
 
     if run_clicked:
         try:
-            with st.spinner("Running procedure…"):
+            with st.spinner('Running report…'):
                 t0 = _time.perf_counter()
                 out_df = session.sql(call_sql).to_pandas()
-                t1 = _time.perf_counter()
-
+                duration_s = _time.perf_counter() - t0
             out_df = norm_cols(out_df) if isinstance(out_df, pd.DataFrame) else pd.DataFrame()
-            duration_s = t1 - t0
-
+            qid = None
             try:
-                qid = session.sql("SELECT LAST_QUERY_ID() AS QID").to_pandas().iloc[0]["QID"]
+                qid = session.sql('SELECT LAST_QUERY_ID() AS QID').to_pandas().iloc[0]['QID']
             except Exception:
-                qid = None
-
-            st.session_state["last_run"] = {
-                "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "db": db,
-                "schema": schema,
-                "proc": proc_name,
-                "type_sig": type_sig,
-                "sql": call_sql,
-                "duration_s": duration_s,
-                "rows": int(len(out_df)) if isinstance(out_df, pd.DataFrame) else 0,
-                "cols": int(len(out_df.columns)) if isinstance(out_df, pd.DataFrame) else 0,
-                "query_id": qid,
-            }
-            st.session_state["last_result_df"] = out_df
-
-            push_history(st.session_state["last_run"])
-            st.success(f"Execution successful · {len(out_df):,} rows · {duration_s:.2f}s")
-
+                pass
+            st.session_state['last_run'] = {'when': datetime.utcnow().isoformat(timespec='seconds') + 'Z', 'db': db, 'schema': schema, 'proc': proc_name, 'proc_instance_key': proc_key, 'display_name': proc_meta.display_name, 'type_sig': type_sig, 'sql': call_sql, 'summary': submission_display, 'duration_s': duration_s, 'rows': int(len(out_df)), 'cols': int(len(out_df.columns)), 'query_id': qid}
+            st.session_state['last_result_df'] = out_df
+            push_history(st.session_state['last_run'])
+            st.success(f'Execution successful · {len(out_df):,} rows · {duration_s:.2f}s')
         except Exception as e:
-            st.error("Execution failed")
+            st.error('Execution failed')
             st.code(str(e))
 
-    if "last_run" in st.session_state and "last_result_df" in st.session_state:
-        lr = st.session_state["last_run"]
-        df_res: pd.DataFrame = st.session_state["last_result_df"]
-
-        st.markdown("### Results")
-
-        mcols = st.columns([1.2, 1.2, 1.2, 2.4], gap="large")
-        mcols[0].metric("Rows", f"{lr.get('rows', 0):,}")
-        mcols[1].metric("Columns", f"{lr.get('cols', 0):,}")
-        mcols[2].metric("Runtime", f"{lr.get('duration_s', 0.0):.2f}s")
-        qid = lr.get("query_id")
-        mcols[3].write(f"**Query ID:** {qid}" if qid else "**Query ID:** —")
-
+    if 'last_run' in st.session_state and 'last_result_df' in st.session_state:
+        lr = st.session_state['last_run']
+        df_res: pd.DataFrame = st.session_state['last_result_df']
+        st.markdown('### Results')
+        metrics = st.columns([1,1,1,2])
+        metrics[0].metric('Rows', f"{lr.get('rows',0):,}")
+        metrics[1].metric('Columns', f"{lr.get('cols',0):,}")
+        metrics[2].metric('Runtime', f"{lr.get('duration_s',0.0):.2f}s")
+        metrics[3].write(f"**Query ID:** {lr.get('query_id') or '—'}")
         if isinstance(df_res, pd.DataFrame) and not df_res.empty:
             st.dataframe(df_res, use_container_width=True, height=520)
-
-            csv_bytes = df_res.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv_bytes,
-                file_name=f"{db}_{schema}_{proc_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.csv",
-                mime="text/csv",
-            )
+            safe_name = re.sub(r'[^A-Za-z0-9]+', '_', proc_meta.display_name).strip('_') or proc_name
+            st.download_button('⬇️ Download CSV', data=df_res.to_csv(index=False).encode('utf-8'), file_name=f"{safe_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.csv", mime='text/csv')
         else:
-            st.info("Procedure executed, but returned no rows (or no tabular output).")
-
+            st.info('Procedure executed, but returned no rows (or no tabular output).')
 
 # =========================================================
 # History Tab
 # =========================================================
 with tab_history:
-    st.subheader("Run History (this session)")
+    st.subheader("Recent Runs")
     hist = st.session_state.get("run_history", [])
     if not hist:
         st.info("No runs yet.")
     else:
         hist_df = pd.DataFrame(hist)
-        show_cols = [c for c in ["when", "db", "schema", "proc", "rows", "cols", "duration_s", "query_id"] if c in hist_df.columns]
+        show_cols = [c for c in ["when", "display_name", "db", "schema", "proc", "rows", "cols", "duration_s", "query_id"] if c in hist_df.columns]
         st.dataframe(hist_df[show_cols], use_container_width=True, height=320)
 
         with st.expander("Details (SQL for recent runs)", expanded=False):
             for i, h in enumerate(hist[:10], start=1):
-                st.markdown(f"**{i}. {h.get('when','')} · {h.get('db','')}.{h.get('schema','')}.{h.get('proc','')}**")
+                st.markdown(f"**{i}. {h.get('when','')} · {h.get('display_name', h.get('proc',''))}**")
                 st.caption(
                     f"Rows={h.get('rows','')} · Runtime={h.get('duration_s',''):.2f}s"
                     if isinstance(h.get("duration_s"), (int, float))
@@ -2501,7 +1921,7 @@ with tab_history:
 # Debug Tab
 # =========================================================
 with tab_debug:
-    st.subheader("Debug")
+    st.subheader("Diagnostics")
     if not CFG_SHOW_DEBUG:
         st.info("Enable **Show debug tools** in the sidebar to see debug panels.")
     else:

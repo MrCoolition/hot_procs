@@ -720,6 +720,14 @@ def run_show(sql_command: str) -> pd.DataFrame:
     return session.sql("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))").to_pandas()
 
 
+def set_session_context(database: str, schema: Optional[str] = None) -> None:
+    """Pin the Snowflake session to the selected database/schema before dependent queries run."""
+    if database:
+        session.sql(f"USE DATABASE {qident(database)}").collect()
+    if database and schema:
+        session.sql(f"USE SCHEMA {qident(database)}.{qident(schema)}").collect()
+
+
 def first_paren_group(s: str) -> str:
     """
     Return the first balanced "(...)" group found in s, including parentheses.
@@ -2467,6 +2475,7 @@ with tab_report:
         try:
             with st.spinner('Running report…'):
                 t0 = _time.perf_counter()
+                set_session_context(db, schema)
                 out_df = session.sql(call_sql).to_pandas()
                 duration_s = _time.perf_counter() - t0
             out_df = norm_cols(out_df) if isinstance(out_df, pd.DataFrame) else pd.DataFrame()

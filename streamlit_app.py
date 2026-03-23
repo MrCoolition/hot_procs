@@ -454,6 +454,32 @@ def build_call_sql(database: str, schema: str, proc_name: str, params: Sequence[
 
 
 
+def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
+    text = str(proc_ddl or '')
+    if not text:
+        return []
+    matches = re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', text)
+    normalized = []
+    for match in matches:
+        stmt = re.sub(r'\s+', ' ', str(match).upper()).strip()
+        normalized.append(f'USE {stmt}')
+    seen = []
+    for stmt in normalized:
+        if stmt not in seen:
+            seen.append(stmt)
+    return seen
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_procedure_ddl(db: str, schema: str, proc: str, type_signature: str) -> str:
+    fq = f"{qident(db)}.{qident(schema)}.{qident(proc)}{type_signature}"
+    sql = f"SELECT GET_DDL('PROCEDURE', '{esc_sql_str(fq)}') AS PROCEDURE_DDL"
+    df = norm_cols(session.sql(sql).to_pandas())
+    if df.empty or 'PROCEDURE_DDL' not in df.columns:
+        return ''
+    return str(df.iloc[0]['PROCEDURE_DDL'] or '')
+
+
 def analyze_execution_error(message: Any) -> Dict[str, Any]:
     text = str(message or '').strip()
     summary = text.splitlines()[-1].strip() if text else 'Unknown execution error.'
@@ -2443,6 +2469,22 @@ with tab_report:
         call_sql = f'-- invalid call: {exc}'
         validation_errors['call_sql'] = str(exc)
 
+    preflight_issue: Optional[Dict[str, Any]] = None
+    try:
+        proc_ddl = get_procedure_ddl(db, schema, proc_name, type_sig)
+        unsupported_use_statements = extract_unsupported_use_statements(proc_ddl)
+        if unsupported_use_statements:
+            preflight_issue = {
+                'summary': 'This procedure cannot run from Streamlit because its body changes Snowflake session context.',
+                'details': [
+                    'Detected session-changing statements in the procedure definition: ' + ', '.join(unsupported_use_statements) + '.',
+                    'Snowflake blocks these statements when the procedure is invoked from this runtime.',
+                ],
+                'hint': 'Update the stored procedure to remove USE statements from its execution path and fully qualify referenced objects instead.',
+            }
+    except Exception:
+        preflight_issue = None
+
     st.markdown('### Run summary')
     if submission_display:
         for line in submission_display:
@@ -2456,9 +2498,15 @@ with tab_report:
         else:
             st.caption('Using positional arguments because Snowflake only exposed generic names such as ARG1/ARG2 for this procedure signature.')
 
-    run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions)
+    run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions) or bool(preflight_issue)
     if validation_errors:
         st.warning('Fix the parameter errors below before running the report.')
+    if preflight_issue:
+        st.error(preflight_issue['summary'])
+        for detail in preflight_issue.get('details') or []:
+            st.caption(detail)
+        if preflight_issue.get('hint'):
+            st.info(preflight_issue['hint'])
     run_row = st.columns([1.2,1.2,4])
     run_clicked = run_row[0].button('🚀 Run report', type='primary', disabled=run_disabled)
     clear_clicked = run_row[1].button('🧹 Clear inputs')

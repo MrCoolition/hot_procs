@@ -1727,6 +1727,7 @@ with tab_report:
     params = harvest_params(db, schema, proc_name, type_sig) or []
     meta_mapping = match_export_metadata(params, export_params_rows) if export_params_rows else {}
     ui_params = [resolve_param_ui_meta(proc_meta, p, idx, overlay_row=meta_mapping.get(str(p.get('name') or f'ARG{idx}')), allow_null=CFG_ALLOW_NULLS) for idx, p in enumerate(params, start=1)]
+    use_named_args_for_call = bool(params) and all(not is_generic_arg_name(str(p.get('name') or '')) for p in params)
     validation_errors: Dict[str, str] = {}
     submissions: List[Tuple[str, ParamSubmission]] = []
     submission_display: List[str] = []
@@ -1827,7 +1828,7 @@ with tab_report:
         st.markdown('<hr class="hr-soft"/>', unsafe_allow_html=True)
 
     try:
-        call_sql = build_call_sql(db, schema, proc_name, submissions, named_args=True)
+        call_sql = build_call_sql(db, schema, proc_name, submissions, named_args=use_named_args_for_call)
     except Exception as exc:
         call_sql = f'-- invalid call: {exc}'
         validation_errors['call_sql'] = str(exc)
@@ -1840,6 +1841,10 @@ with tab_report:
         st.caption('No parameter values selected yet.')
     with st.expander('Generated CALL SQL', expanded=False):
         st.code(call_sql)
+        if use_named_args_for_call:
+            st.caption('Using named arguments because the procedure signature exposed real parameter names.')
+        else:
+            st.caption('Using positional arguments because Snowflake only exposed generic names such as ARG1/ARG2 for this procedure signature.')
 
     run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions)
     if validation_errors:

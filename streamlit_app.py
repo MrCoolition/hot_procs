@@ -275,6 +275,26 @@ def sql_literal(value: Any, dtype: str) -> str:
     return f"'{esc_sql_str(str(value))}'"
 
 
+def extract_proc_name_from_export_sql(export_sql: str) -> str:
+    sql = str(export_sql or '').strip()
+    if not sql:
+        return ''
+    normalized = re.sub(r'\s+', ' ', sql)
+    patterns = [
+        r'(?i)\bCALL\s+((?:"[^"]+"|[A-Z0-9_]+)(?:\.(?:"[^"]+"|[A-Z0-9_]+)){0,2})\s*\(',
+        r'(?i)\bFROM\s+TABLE\s*\(\s*((?:"[^"]+"|[A-Z0-9_]+)(?:\.(?:"[^"]+"|[A-Z0-9_]+)){0,2})\s*\(',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, normalized)
+        if not m:
+            continue
+        ident = m.group(1)
+        parts = [part.strip().strip('"') for part in ident.split('.') if part.strip()]
+        if parts:
+            return parts[-1].upper()
+    return ''
+
+
 def match_export_metadata(params: Sequence[Dict[str, Any]], meta_rows: Sequence[Dict[str, Any]], proc_key: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     by_token = {}
     by_name = {}
@@ -1809,66 +1829,141 @@ def find_export_metadata_tables(db: str) -> List[Dict[str, Any]]:
     SELECT
       TABLE_SCHEMA,
       TABLE_NAME,
-      COUNT(DISTINCT UPPER(COLUMN_NAME)) AS HIT_COUNT
+      ARRAY_AGG(DISTINCT UPPER(COLUMN_NAME)) WITHIN GROUP (ORDER BY UPPER(COLUMN_NAME)) AS COLS
     FROM {qident(db)}.INFORMATION_SCHEMA.COLUMNS
-    WHERE UPPER(COLUMN_NAME) IN (
-      'EXPORTREPORTCODE',
-      'EXPORTREPORTNAME',
-      'EXPORTREPORTDESCRIPTION',
-      'EXPORTPARAMNAME',
-      'EXPORTPARAMTOKEN',
-      'EXPORTPARAMPROMPT'
-    )
+    WHERE UPPER(COLUMN_NAME) LIKE 'EXPORT%'
     GROUP BY TABLE_SCHEMA, TABLE_NAME
-    HAVING COUNT(DISTINCT UPPER(COLUMN_NAME)) >= 3
-    ORDER BY HIT_COUNT DESC, TABLE_SCHEMA, TABLE_NAME
+    ORDER BY TABLE_SCHEMA, TABLE_NAME
     """
     try:
         df = norm_cols(session.sql(sql).to_pandas())
     except Exception:
         return []
 
-    out: List[Dict[str, Any]] = []
+    buckets: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for _, r in df.iterrows():
-        out.append(
-            {
-                "schema": str(r.get("TABLE_SCHEMA", "")),
-                "table": str(r.get("TABLE_NAME", "")),
-                "score": int(r.get("HIT_COUNT", 0)),
-            }
-        )
+        schema = str(r.get("TABLE_SCHEMA") or "").strip()
+        table = str(r.get("TABLE_NAME") or "").strip()
+        cols_raw = r.get("COLS")
+        if isinstance(cols_raw, list):
+            col_values = cols_raw
+        elif isinstance(cols_raw, str):
+            col_values = [c.strip().strip('[]" ') for c in cols_raw.split(',') if c.strip()]
+        else:
+            col_values = []
+        cols = {str(c).upper() for c in col_values if str(c).strip()}
+        row = {"schema": schema, "table": table, "cols": cols}
+        bucket = buckets.setdefault(schema, {"reports": [], "bridges": [], "params": []})
+        if {'EXPORTREPORTKEY', 'EXPORTREPORTCODE', 'EXPORTREPORTNAME'}.issubset(cols):
+            bucket['reports'].append(row)
+        if {'EXPORTREPORTKEY', 'EXPORTPARAMKEY'}.issubset(cols):
+            bucket['bridges'].append(row)
+        if {'EXPORTPARAMKEY', 'EXPORTPARAMNAME', 'EXPORTPARAMTOKEN'}.issubset(cols):
+            bucket['params'].append(row)
+
+    out: List[Dict[str, Any]] = []
+    for schema, groups in buckets.items():
+        if groups['reports'] and groups['params']:
+            if groups['bridges']:
+                for reports in groups['reports']:
+                    for bridge in groups['bridges']:
+                        for params in groups['params']:
+                            out.append({
+                                'schema': schema,
+                                'reports_table': reports['table'],
+                                'bridge_table': bridge['table'],
+                                'params_table': params['table'],
+                                'mode': 'joined',
+                                'score': 100,
+                            })
+            else:
+                for reports in groups['reports']:
+                    if {'EXPORTPARAMNAME', 'EXPORTPARAMTOKEN'}.issubset(reports['cols']):
+                        out.append({
+                            'schema': schema,
+                            'reports_table': reports['table'],
+                            'bridge_table': '',
+                            'params_table': reports['table'],
+                            'mode': 'single',
+                            'score': 50,
+                        })
+    out.sort(key=lambda r: (-int(r.get('score') or 0), r.get('schema') or '', r.get('reports_table') or '', r.get('params_table') or ''))
     return out
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_export_reports(db: str, meta_schema: str, meta_table: str) -> pd.DataFrame:
-    fq = f"{qident(db)}.{qident(meta_schema)}.{qident(meta_table)}"
-    sql = f"""
-    SELECT DISTINCT
-      ExportReportCode,
-      ExportReportName
-    FROM {fq}
-    WHERE ExportReportCode IS NOT NULL
-    ORDER BY ExportReportCode
+def report_metadata_query(db: str, source: Dict[str, Any], report_code: Optional[str] = None, params_only: bool = False) -> str:
+    schema = source['schema']
+    reports_fq = f"{qident(db)}.{qident(schema)}.{qident(source['reports_table'])}"
+    mode = str(source.get('mode') or 'single').lower()
+    filters = ["a.ExportReportCode IS NOT NULL"]
+    if report_code:
+        filters.append(f"a.ExportReportCode = '{esc_sql_str(report_code)}'")
+    where_clause = ' AND '.join(filters)
+    if mode == 'joined' and source.get('bridge_table') and source.get('params_table'):
+        bridge_fq = f"{qident(db)}.{qident(schema)}.{qident(source['bridge_table'])}"
+        params_fq = f"{qident(db)}.{qident(schema)}.{qident(source['params_table'])}"
+        select_list = """
+      a.ExportReportCode,
+      a.ExportReportName,
+      a.ExportReportDescription,
+      a.ExportReportSQL,
+      c.ExportParamName,
+      c.ExportParamToken,
+      c.ExportParamPrompt
+        """.strip()
+        if params_only:
+            select_list = """
+      c.ExportParamName,
+      c.ExportParamToken,
+      c.ExportParamPrompt
+            """.strip()
+        return f"""
+    SELECT {select_list}
+    FROM {reports_fq} a
+    LEFT JOIN {bridge_fq} b ON a.ExportReportKey = b.ExportReportKey
+    LEFT JOIN {params_fq} c ON b.ExportParamKey = c.ExportParamKey
+    WHERE {where_clause}
+    ORDER BY a.ExportReportCode, c.ExportParamToken, c.ExportParamName
     """
-    try:
-        return norm_cols(session.sql(sql).to_pandas())
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_export_params_for_report(db: str, meta_schema: str, meta_table: str, report_code: str) -> pd.DataFrame:
-    fq = f"{qident(db)}.{qident(meta_schema)}.{qident(meta_table)}"
-    sql = f"""
-    SELECT
+    select_list = """
+      ExportReportCode,
+      ExportReportName,
+      ExportReportDescription,
+      ExportReportSQL,
       ExportParamName,
       ExportParamToken,
       ExportParamPrompt
-    FROM {fq}
-    WHERE ExportReportCode = '{esc_sql_str(report_code)}'
-    ORDER BY ExportParamToken, ExportParamName
+    """.strip()
+    if params_only:
+        select_list = """
+      ExportParamName,
+      ExportParamToken,
+      ExportParamPrompt
+        """.strip()
+    return f"""
+    SELECT {select_list}
+    FROM {reports_fq}
+    WHERE {where_clause}
+    ORDER BY ExportReportCode, ExportParamToken, ExportParamName
     """
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_export_reports(db: str, source: Dict[str, Any]) -> pd.DataFrame:
+    sql = report_metadata_query(db, source)
+    try:
+        df = norm_cols(session.sql(sql).to_pandas())
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    subset = [c for c in ['EXPORTREPORTCODE', 'EXPORTREPORTNAME', 'EXPORTREPORTDESCRIPTION', 'EXPORTREPORTSQL'] if c in df.columns]
+    return df[subset].drop_duplicates().sort_values(['EXPORTREPORTCODE', 'EXPORTREPORTNAME']).reset_index(drop=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_export_params_for_report(db: str, source: Dict[str, Any], report_code: str) -> pd.DataFrame:
+    sql = report_metadata_query(db, source, report_code=report_code, params_only=True)
     try:
         return norm_cols(session.sql(sql).to_pandas())
     except Exception:
@@ -2163,21 +2258,39 @@ with tab_report:
 
     proc_search = st.text_input('Search reports', value='', placeholder='Search by report name, description, comment, procedure, or schema', key='proc_search')
     meta_candidates = find_export_metadata_tables(db) if CFG_ENABLE_METADATA_OVERLAY else []
-    export_row_by_proc = {}
-    export_params_rows: List[Dict[str, Any]] = []
+    export_row_by_proc: Dict[str, Dict[str, Any]] = {}
+    export_params_by_proc: Dict[str, List[Dict[str, Any]]] = {}
     chosen_report_code = ''
+    chosen_report_proc = ''
     if meta_candidates:
         picked = meta_candidates[0]
-        reports_df = get_export_reports(db, picked['schema'], picked['table'])
+        reports_df = get_export_reports(db, picked)
         if not reports_df.empty and 'EXPORTREPORTCODE' in reports_df.columns:
-            report_options = [f"{str(r.get('EXPORTREPORTNAME') or r.get('EXPORTREPORTCODE') or '').strip()} — {str(r.get('EXPORTREPORTCODE') or '').strip()}" for _, r in reports_df.iterrows()]
+            report_options = []
+            report_records: List[Dict[str, Any]] = []
+            for _, report_row in reports_df.iterrows():
+                report_dict = report_row.to_dict()
+                report_code = str(report_dict.get('EXPORTREPORTCODE') or '').strip()
+                report_name = str(report_dict.get('EXPORTREPORTNAME') or report_code or '').strip()
+                target_proc = extract_proc_name_from_export_sql(report_dict.get('EXPORTREPORTSQL'))
+                if target_proc:
+                    export_row_by_proc[target_proc] = report_dict
+                report_options.append(f"{report_name} — {report_code}" if report_code else report_name)
+                report_records.append(report_dict)
             chosen_report_label = st.selectbox('Report metadata', options=['(None)'] + report_options, key='report_pick')
             if chosen_report_label != '(None)':
-                chosen_report_row = reports_df.iloc[report_options.index(chosen_report_label)]
+                chosen_report_row = report_records[report_options.index(chosen_report_label)]
                 chosen_report_code = str(chosen_report_row.get('EXPORTREPORTCODE') or '').strip()
-                export_row_by_proc = {str(r.get('NAME') or '').upper(): chosen_report_row.to_dict() for _, r in procs_df.iterrows()}
-                export_params_df = get_export_params_for_report(db, picked['schema'], picked['table'], chosen_report_code)
+                chosen_report_proc = extract_proc_name_from_export_sql(chosen_report_row.get('EXPORTREPORTSQL'))
+                if chosen_report_proc:
+                    export_row_by_proc[chosen_report_proc] = chosen_report_row
+                export_params_df = get_export_params_for_report(db, picked, chosen_report_code)
                 export_params_rows = export_params_df.to_dict('records') if not export_params_df.empty else []
+                if chosen_report_proc:
+                    export_params_by_proc[chosen_report_proc] = export_params_rows
+                    st.caption(f'Silver-platter metadata linked report code {chosen_report_code or "(unknown)"} to procedure {chosen_report_proc}.')
+                elif export_params_rows:
+                    st.caption('Loaded report metadata, but could not infer a target procedure from ExportReportSQL.')
 
     proc_options = []
     for _, row in procs_df.iterrows():
@@ -2188,6 +2301,8 @@ with tab_report:
         if str(row.get('COMMENT') or '').strip() and display != str(row.get('COMMENT') or '').strip():
             display = f"{display} — {str(row.get('COMMENT') or '').strip()}"
         proc_options.append((str(row['PROC_ID']), display, proc_meta))
+    if chosen_report_proc:
+        proc_options = [p for p in proc_options if p[2].proc_name.upper() == chosen_report_proc]
     if proc_search.strip():
         search = proc_search.strip().lower()
         proc_options = [p for p in proc_options if search in p[1].lower() or search in p[2].proc_name.lower() or search in p[2].schema.lower()]
@@ -2211,7 +2326,8 @@ with tab_report:
         st.caption(f'Created: {proc_created_on or "—"}')
 
     params = harvest_params(db, schema, proc_name, type_sig) or []
-    meta_mapping = match_export_metadata(params, export_params_rows) if export_params_rows else {}
+    proc_export_params = export_params_by_proc.get(proc_name.upper(), [])
+    meta_mapping = match_export_metadata(params, proc_export_params) if proc_export_params else {}
     ui_params = [resolve_param_ui_meta(proc_meta, p, idx, overlay_row=meta_mapping.get(str(p.get('name') or f'ARG{idx}')), allow_null=CFG_ALLOW_NULLS) for idx, p in enumerate(params, start=1)]
     use_named_args_for_call = bool(params) and all(not is_generic_arg_name(str(p.get('name') or '')) for p in params)
     validation_errors: Dict[str, str] = {}

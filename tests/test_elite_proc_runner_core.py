@@ -93,6 +93,12 @@ def test_analyze_execution_error_for_missing_function_dependency():
     assert 'Verify that the function exists' in err['hint']
 
 
+def test_analyze_execution_error_for_unsupported_statement_type():
+    err = analyze_execution_error("(1304): x: 090236 (42601): Stored procedure execution error: Unsupported statement type 'USE'.")
+    assert err['category'] == 'unsupported_statement'
+    assert err['object_name'] == 'USE'
+    assert 'fully qualify object references' in err['hint']
+
 def test_analyze_execution_error_for_missing_schema_dependency():
     err = analyze_execution_error("Schema 'FOODBUY_MASALA_PROD.BTS' does not exist or not authorized.")
     assert err['category'] == 'missing_schema'

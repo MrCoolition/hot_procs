@@ -448,6 +448,22 @@ def analyze_execution_error(message: Any) -> Dict[str, Any]:
             'raw_message': text,
         }
 
+    unsupported_stmt = re.search(r"Unsupported statement type '([^']+)'", text, re.IGNORECASE)
+    if unsupported_stmt:
+        object_name = unsupported_stmt.group(1).upper()
+        category = 'unsupported_statement'
+        summary = f'Unsupported statement inside the stored procedure: {object_name}'
+        details.append('The stored procedure tried to execute a SQL statement type that is not allowed in this runtime.')
+        hint = 'Remove session-changing statements such as USE DATABASE/SCHEMA from the execution path, or fully qualify object references before retrying.'
+        return {
+            'category': category,
+            'summary': summary,
+            'details': details,
+            'hint': hint,
+            'object_name': object_name,
+            'raw_message': text,
+        }
+
     if 'SQL compilation error' in text.upper():
         category = 'sql_compilation'
         summary = 'SQL compilation error inside the stored procedure'

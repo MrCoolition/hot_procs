@@ -215,6 +215,20 @@ def run_show(sql_command: str) -> pd.DataFrame:
     return session.sql("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))").to_pandas()
 
 
+def set_session_context(db: Optional[str] = None, schema: Optional[str] = None) -> None:
+    """
+    Pin the Snowflake session to a known database/schema before metadata reads or CALLs.
+
+    Some stored procedures and dependent SQL objects resolve partially-qualified names
+    against the caller's current database/schema, so we align the session context with
+    the report selection first.
+    """
+    if db:
+        session.sql(f"USE DATABASE {qident(db)}").collect()
+    if schema:
+        session.sql(f"USE SCHEMA {qident(schema)}").collect()
+
+
 def first_paren_group(s: str) -> str:
     """
     Return the first balanced "(...)" group found in s, including parentheses.
@@ -1367,6 +1381,7 @@ def get_export_reports(db: str, meta_schema: str, meta_table: str) -> pd.DataFra
     ORDER BY ExportReportCode
     """
     try:
+        set_session_context(db, meta_schema)
         return norm_cols(session.sql(sql).to_pandas())
     except Exception:
         return pd.DataFrame()
@@ -1385,6 +1400,7 @@ def get_export_params_for_report(db: str, meta_schema: str, meta_table: str, rep
     ORDER BY ExportParamToken, ExportParamName
     """
     try:
+        set_session_context(db, meta_schema)
         return norm_cols(session.sql(sql).to_pandas())
     except Exception:
         return pd.DataFrame()
@@ -1397,6 +1413,7 @@ def get_export_params_for_report(db: str, meta_schema: str, meta_table: str, rep
 def describe_procedure_df(db: str, schema: str, proc: str, type_signature: str) -> pd.DataFrame:
     fq = f"{qident(db)}.{qident(schema)}.{qident(proc)}"
     sql = f"DESCRIBE PROCEDURE {fq}{type_signature}"
+    set_session_context(db, schema)
     return norm_cols(session.sql(sql).to_pandas())
 
 
@@ -1865,6 +1882,7 @@ with tab_report:
     if run_clicked:
         try:
             with st.spinner('Running report…'):
+                set_session_context(db, schema)
                 t0 = _time.perf_counter()
                 out_df = session.sql(call_sql).to_pandas()
                 duration_s = _time.perf_counter() - t0

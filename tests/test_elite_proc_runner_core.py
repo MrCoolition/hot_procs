@@ -93,6 +93,13 @@ def test_analyze_execution_error_for_missing_function_dependency():
     assert 'Verify that the function exists' in err['hint']
 
 
+def test_analyze_execution_error_for_missing_schema_dependency():
+    err = analyze_execution_error("Schema 'FOODBUY_MASALA_PROD.BTS' does not exist or not authorized.")
+    assert err['category'] == 'missing_schema'
+    assert err['object_name'] == 'FOODBUY_MASALA_PROD.BTS'
+    assert 'session database/schema context' in err['hint']
+
+
 def test_required_params_do_not_offer_null_mode_even_when_global_nulls_enabled():
     proc_meta = ProcUIMeta('DB', 'SCHEMA', 'PROC', '(NUMBER)', 'Proc')
 

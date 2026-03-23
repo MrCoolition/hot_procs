@@ -432,6 +432,22 @@ def analyze_execution_error(message: Any) -> Dict[str, Any]:
             'raw_message': text,
         }
 
+    missing_schema = re.search(r"Schema\s+'([^']+)'\s+does not exist or not authorized", text, re.IGNORECASE)
+    if missing_schema:
+        object_name = missing_schema.group(1).rstrip('.')
+        category = 'missing_schema'
+        summary = f'Missing or unauthorized schema: {object_name}'
+        details.append('Snowflake could not resolve a schema referenced by the stored procedure or one of its dependent queries.')
+        hint = 'Confirm the caller role can use that schema and that the session database/schema context is set to the report\'s database/schema before execution.'
+        return {
+            'category': category,
+            'summary': summary,
+            'details': details,
+            'hint': hint,
+            'object_name': object_name,
+            'raw_message': text,
+        }
+
     if 'SQL compilation error' in text.upper():
         category = 'sql_compilation'
         summary = 'SQL compilation error inside the stored procedure'

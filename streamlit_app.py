@@ -452,6 +452,102 @@ def build_call_sql(database: str, schema: str, proc_name: str, params: Sequence[
     return f'CALL {fq}({rendered});'
 
 
+def split_sql_statements(sql_text: str) -> List[str]:
+    text = str(sql_text or '')
+    if not text.strip():
+        return []
+    statements: List[str] = []
+    buff: List[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ''
+        if ch == "'" and not in_double:
+            buff.append(ch)
+            if in_single and nxt == "'":
+                buff.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buff.append(ch)
+            i += 1
+            continue
+        if ch == ';' and not in_single and not in_double:
+            stmt = ''.join(buff).strip()
+            if stmt:
+                statements.append(stmt)
+            buff = []
+            i += 1
+            continue
+        buff.append(ch)
+        i += 1
+    tail = ''.join(buff).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def translate_export_sql(export_sql: str, database: str, schema: str) -> Tuple[List[str], List[str]]:
+    translated: List[str] = []
+    removed: List[str] = []
+    for stmt in split_sql_statements(export_sql):
+        normalized = re.sub(r'\s+', ' ', stmt).strip().upper()
+        if re.match(r'^USE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', normalized):
+            removed.append(stmt.strip())
+            continue
+        call_match = re.match(r'(?is)^CALL\s+((?:"[^"]+"|[A-Z0-9_]+)(?:\.(?:"[^"]+"|[A-Z0-9_]+)){0,2})\s*\((.*)\)\s*$', stmt.strip())
+        if call_match:
+            ident = call_match.group(1)
+            args = call_match.group(2)
+            parts = [p.strip().strip('"') for p in ident.split('.') if p.strip()]
+            if len(parts) == 1:
+                fq_ident = f'{qident(database)}.{qident(schema)}.{qident(parts[0])}'
+            elif len(parts) == 2:
+                fq_ident = f'{qident(database)}.{qident(parts[0])}.{qident(parts[1])}'
+            else:
+                fq_ident = '.'.join(qident(p) for p in parts[-3:])
+            translated.append(f'CALL {fq_ident}({args})')
+        else:
+            translated.append(stmt.strip())
+    return translated, removed
+
+
+def apply_param_tokens_to_sql(statements: Sequence[str], params: Sequence[Tuple[str, ParamSubmission]]) -> List[str]:
+    by_token: Dict[str, str] = {}
+    for name, submission in params:
+        if submission.mode == 'DEFAULT':
+            continue
+        if not submission.is_valid:
+            continue
+        literal = submission.sql_literal or 'NULL'
+        token = normalize_name(name)
+        if token:
+            by_token[token] = literal
+    rendered: List[str] = []
+    token_re = re.compile(r'@([A-Z0-9_]+)')
+    for stmt in statements:
+        def _replace(match: re.Match[str]) -> str:
+            key = normalize_name(match.group(1))
+            return by_token.get(key, match.group(0))
+        rendered.append(token_re.sub(_replace, stmt))
+    return rendered
+
+
+def run_sql_script(statements: Sequence[str]) -> pd.DataFrame:
+    cleaned = [s.strip().rstrip(';') for s in statements if str(s or '').strip()]
+    if not cleaned:
+        return pd.DataFrame()
+    for stmt in cleaned[:-1]:
+        session.sql(stmt).collect()
+    return session.sql(cleaned[-1]).to_pandas()
+
+
 
 
 def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
@@ -2432,6 +2528,7 @@ with tab_report:
     export_params_by_proc: Dict[str, List[Dict[str, Any]]] = {}
     chosen_report_code = ''
     chosen_report_proc = ''
+    selected_export_sql = ''
     if meta_candidates:
         picked = meta_candidates[0]
         reports_df = get_export_reports(db, picked)
@@ -2482,6 +2579,7 @@ with tab_report:
     selected_proc_id = st.selectbox('Report', options=[p[0] for p in proc_options], format_func=lambda pid: next(x[1] for x in proc_options if x[0] == pid), key='proc_select')
     proc_row = procs_df[procs_df['PROC_ID'] == selected_proc_id].iloc[0]
     proc_name = str(proc_row.get('NAME') or '').strip()
+    selected_export_sql = str((export_row_by_proc.get(proc_name.upper()) or {}).get('EXPORTREPORTSQL') or '')
     raw_args = str(proc_row.get('ARGUMENTS') or '').strip()
     proc_comment = str(proc_row.get('COMMENT') or '').strip()
     proc_created_on = str(proc_row.get('CREATED_ON') or '').strip()
@@ -2627,7 +2725,13 @@ with tab_report:
         else:
             st.caption('Using positional arguments because Snowflake only exposed generic names such as ARG1/ARG2 for this procedure signature.')
 
-    run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions) or bool(preflight_issue)
+    translated_script: List[str] = []
+    removed_forbidden_statements: List[str] = []
+    if preflight_issue and selected_export_sql.strip():
+        translated_script, removed_forbidden_statements = translate_export_sql(selected_export_sql, db, schema)
+        translated_script = apply_param_tokens_to_sql(translated_script, submissions)
+    can_auto_translate = bool(translated_script)
+    run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions) or (bool(preflight_issue) and not can_auto_translate)
     if validation_errors:
         st.warning('Fix the parameter errors below before running the report.')
     if preflight_issue:
@@ -2641,6 +2745,14 @@ with tab_report:
                 st.caption(line)
         if preflight_issue.get('hint'):
             st.info(preflight_issue['hint'])
+        if can_auto_translate:
+            st.success('Auto-translation is available. This app can run translated SQL directly without USE statements.')
+            if removed_forbidden_statements:
+                st.info('Removed forbidden statements:')
+                for stmt in removed_forbidden_statements:
+                    st.caption(stmt)
+            with st.expander('Translated SQL script (auto-generated)', expanded=False):
+                st.code(';\n'.join(translated_script) + ';', language='sql')
         if preflight_issue.get('developer_note'):
             with st.expander('Developer handoff', expanded=False):
                 st.code(preflight_issue['developer_note'])
@@ -2660,8 +2772,13 @@ with tab_report:
         try:
             with st.spinner('Running report…'):
                 t0 = _time.perf_counter()
-                set_session_context(db, schema)
-                out_df = session.sql(call_sql).to_pandas()
+                if preflight_issue and can_auto_translate:
+                    out_df = run_sql_script(translated_script)
+                    executed_sql = ';\n'.join(translated_script) + ';'
+                else:
+                    set_session_context(db, schema)
+                    out_df = session.sql(call_sql).to_pandas()
+                    executed_sql = call_sql
                 duration_s = _time.perf_counter() - t0
             out_df = norm_cols(out_df) if isinstance(out_df, pd.DataFrame) else pd.DataFrame()
             qid = None
@@ -2669,7 +2786,7 @@ with tab_report:
                 qid = session.sql('SELECT LAST_QUERY_ID() AS QID').to_pandas().iloc[0]['QID']
             except Exception:
                 pass
-            st.session_state['last_run'] = {'when': datetime.utcnow().isoformat(timespec='seconds') + 'Z', 'db': db, 'schema': schema, 'proc': proc_name, 'proc_instance_key': proc_key, 'display_name': proc_meta.display_name, 'type_sig': type_sig, 'sql': call_sql, 'summary': submission_display, 'duration_s': duration_s, 'rows': int(len(out_df)), 'cols': int(len(out_df.columns)), 'query_id': qid}
+            st.session_state['last_run'] = {'when': datetime.utcnow().isoformat(timespec='seconds') + 'Z', 'db': db, 'schema': schema, 'proc': proc_name, 'proc_instance_key': proc_key, 'display_name': proc_meta.display_name, 'type_sig': type_sig, 'sql': executed_sql, 'summary': submission_display, 'duration_s': duration_s, 'rows': int(len(out_df)), 'cols': int(len(out_df.columns)), 'query_id': qid}
             st.session_state['last_result_df'] = out_df
             push_history(st.session_state['last_run'])
             st.success(f'Execution successful · {len(out_df):,} rows · {duration_s:.2f}s')

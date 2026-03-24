@@ -548,6 +548,12 @@ def run_sql_script(statements: Sequence[str]) -> pd.DataFrame:
     return session.sql(cleaned[-1]).to_pandas()
 
 
+def translate_export_sql_with_params(export_sql: str, database: str, schema: str, submissions: Sequence[Tuple[str, ParamSubmission]]) -> Tuple[List[str], List[str]]:
+    translated_script, removed_forbidden_statements = translate_export_sql(export_sql, database, schema)
+    translated_script = apply_param_tokens_to_sql(translated_script, submissions)
+    return translated_script, removed_forbidden_statements
+
+
 
 
 def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
@@ -2728,8 +2734,7 @@ with tab_report:
     translated_script: List[str] = []
     removed_forbidden_statements: List[str] = []
     if preflight_issue and selected_export_sql.strip():
-        translated_script, removed_forbidden_statements = translate_export_sql(selected_export_sql, db, schema)
-        translated_script = apply_param_tokens_to_sql(translated_script, submissions)
+        translated_script, removed_forbidden_statements = translate_export_sql_with_params(selected_export_sql, db, schema, submissions)
     can_auto_translate = bool(translated_script)
     run_disabled = bool(validation_errors) or any(s.mode == 'UNSET' for _, s in submissions) or (bool(preflight_issue) and not can_auto_translate)
     if validation_errors:
@@ -2792,6 +2797,34 @@ with tab_report:
             st.success(f'Execution successful · {len(out_df):,} rows · {duration_s:.2f}s')
         except Exception as e:
             err_info = analyze_execution_error(e)
+            if err_info.get('category') == 'unsupported_statement' and err_info.get('object_name') == 'USE' and selected_export_sql.strip():
+                try:
+                    translated_script, removed_forbidden_statements = translate_export_sql_with_params(selected_export_sql, db, schema, submissions)
+                    if translated_script:
+                        with st.spinner('Retrying with translated SQL (without USE statements)…'):
+                            t0 = _time.perf_counter()
+                            out_df = run_sql_script(translated_script)
+                            duration_s = _time.perf_counter() - t0
+                        out_df = norm_cols(out_df) if isinstance(out_df, pd.DataFrame) else pd.DataFrame()
+                        executed_sql = ';\n'.join(translated_script) + ';'
+                        qid = None
+                        try:
+                            qid = session.sql('SELECT LAST_QUERY_ID() AS QID').to_pandas().iloc[0]['QID']
+                        except Exception:
+                            pass
+                        st.session_state['last_run'] = {'when': datetime.utcnow().isoformat(timespec='seconds') + 'Z', 'db': db, 'schema': schema, 'proc': proc_name, 'proc_instance_key': proc_key, 'display_name': proc_meta.display_name, 'type_sig': type_sig, 'sql': executed_sql, 'summary': submission_display, 'duration_s': duration_s, 'rows': int(len(out_df)), 'cols': int(len(out_df.columns)), 'query_id': qid}
+                        st.session_state['last_result_df'] = out_df
+                        push_history(st.session_state['last_run'])
+                        st.success(f'Execution successful after USE-remediation fallback · {len(out_df):,} rows · {duration_s:.2f}s')
+                        if removed_forbidden_statements:
+                            st.info('Removed forbidden statements:')
+                            for stmt in removed_forbidden_statements:
+                                st.caption(stmt)
+                        with st.expander('Translated SQL script executed', expanded=False):
+                            st.code(executed_sql, language='sql')
+                        st.stop()
+                except Exception:
+                    pass
             qid = None
             try:
                 qid = session.sql('SELECT LAST_QUERY_ID() AS QID').to_pandas().iloc[0]['QID']

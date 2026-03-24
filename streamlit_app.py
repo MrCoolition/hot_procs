@@ -458,18 +458,52 @@ def extract_unsupported_use_statements(proc_ddl: str) -> List[str]:
     text = str(proc_ddl or '')
     if not text:
         return []
-    matches = re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', text)
+    statement_re = re.compile(
+        r'(?im)^\s*(USE\s+(?:DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b[^;\n]*;?)'
+    )
+    statements = statement_re.findall(text)
     for quoted in re.findall(r"'([^']*)'", text):
-        matches.extend(re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', quoted))
+        statements.extend(statement_re.findall(quoted))
     normalized = []
-    for match in matches:
-        stmt = re.sub(r'\s+', ' ', str(match).upper()).strip()
-        normalized.append(f'USE {stmt}')
+    for match in statements:
+        stmt = re.sub(r'\s+', ' ', str(match).strip()).upper()
+        if stmt and not stmt.endswith(';'):
+            stmt = f'{stmt};'
+        normalized.append(stmt)
+    if not normalized:
+        matches = re.findall(r'(?im)\bUSE\s+(DATABASE|SCHEMA|ROLE|WAREHOUSE|SECONDARY\s+ROLES?)\b', text)
+        for match in matches:
+            stmt = re.sub(r'\s+', ' ', str(match).upper()).strip()
+            normalized.append(f'USE {stmt};')
     seen = []
     for stmt in normalized:
         if stmt not in seen:
             seen.append(stmt)
     return seen
+
+
+def translate_use_statement(stmt: str, database: str, schema: str) -> str:
+    clean_stmt = str(stmt or '').strip()
+    normalized = re.sub(r'\s+', ' ', clean_stmt).upper().rstrip(';')
+    fq_prefix = f'{qident(database)}.{qident(schema)}'
+    if normalized.startswith('USE DATABASE '):
+        target_db = normalized.removeprefix('USE DATABASE ').strip()
+        return f'{clean_stmt} -> remove it and qualify objects as {qident(target_db)}.<SCHEMA>.<OBJECT>'
+    if normalized.startswith('USE SCHEMA '):
+        target_schema = normalized.removeprefix('USE SCHEMA ').strip()
+        if '.' in target_schema:
+            db_name, schema_name = [part.strip() for part in target_schema.split('.', 1)]
+            return f'{clean_stmt} -> remove it and qualify objects as {qident(db_name)}.{qident(schema_name)}.<OBJECT>'
+        return f'{clean_stmt} -> remove it and qualify objects as {qident(database)}.{qident(target_schema)}.<OBJECT>'
+    if normalized.startswith('USE ROLE '):
+        target_role = normalized.removeprefix('USE ROLE ').strip()
+        return f'{clean_stmt} -> remove it and grant the needed privileges to {qident(target_role)}, or move role selection outside the procedure'
+    if normalized.startswith('USE WAREHOUSE '):
+        target_wh = normalized.removeprefix('USE WAREHOUSE ').strip()
+        return f'{clean_stmt} -> remove it and assign warehouse {qident(target_wh)} to the Streamlit app/session outside the procedure'
+    if normalized.startswith('USE SECONDARY ROLE') or normalized.startswith('USE SECONDARY ROLES '):
+        return f'{clean_stmt} -> remove it and grant privileges directly to the executing role instead of activating secondary roles in-proc'
+    return f'{clean_stmt} -> remove it and qualify referenced objects explicitly, e.g. {fq_prefix}.<OBJECT>'
 
 
 def build_streamlit_proc_hardening_guide(database: str, schema: str, proc_name: str) -> str:
@@ -535,6 +569,7 @@ def build_use_statement_remediation(database: str, schema: str, proc_name: str, 
     fq_proc = f'{database}.{schema}.{proc_name}'
     quoted_fq_proc = f'{qident(database)}.{qident(schema)}.{qident(proc_name)}'
     unique_statements = list(dict.fromkeys(str(stmt).strip() for stmt in statements if str(stmt).strip()))
+    translated_statements = [translate_use_statement(stmt, database, schema) for stmt in unique_statements]
     hardening_guide = build_streamlit_proc_hardening_guide(database, schema, proc_name)
     return {
         'summary': 'This procedure cannot run from Streamlit because its body changes Snowflake session context.',
@@ -543,10 +578,14 @@ def build_use_statement_remediation(database: str, schema: str, proc_name: str, 
             'Snowflake blocks these statements when the procedure is invoked from Streamlit or other restricted runtimes.',
             f'Convert {fq_proc} from session-context-driven SQL to fully qualified SQL so object resolution does not depend on USE statements.',
         ],
-        'hint': 'Yes: rewrite the procedure to remove USE statements, fully qualify every referenced object, and qualify SQL inside EXECUTE IMMEDIATE strings.',
+        'hint': 'Translate each USE statement into fully qualified object names or external session/app configuration, then recreate the procedure and retry.',
+        'translated_statements': translated_statements,
         'developer_note': '\n'.join([
             f'Procedure: {quoted_fq_proc}',
             'Blocked statements: ' + ', '.join(unique_statements),
+            '',
+            'Translated USE statements:',
+            *[f'  - {line}' for line in translated_statements],
             '',
             'Answer:',
             'Yes. Convert the procedure from session-context-driven SQL to fully qualified SQL, and it should run from Streamlit if context dependence is the blocker.',
@@ -2595,6 +2634,11 @@ with tab_report:
         st.error(preflight_issue['summary'])
         for detail in preflight_issue.get('details') or []:
             st.caption(detail)
+        translated_statements = preflight_issue.get('translated_statements') or []
+        if translated_statements:
+            st.info('Translated USE statements:')
+            for line in translated_statements:
+                st.caption(line)
         if preflight_issue.get('hint'):
             st.info(preflight_issue['hint'])
         if preflight_issue.get('developer_note'):
@@ -2661,7 +2705,20 @@ with tab_report:
             if err_info.get('hint'):
                 st.info(err_info['hint'])
             if err_info.get('category') == 'unsupported_statement' and err_info.get('object_name') == 'USE':
-                runtime_use_issue = build_use_statement_remediation(db, schema, proc_name, ['USE'])
+                runtime_use_issue = build_use_statement_remediation(
+                    db,
+                    schema,
+                    proc_name,
+                    [
+                        f'USE DATABASE {db};',
+                        f'USE SCHEMA {db}.{schema};',
+                    ],
+                )
+                translated_runtime_statements = runtime_use_issue.get('translated_statements') or []
+                if translated_runtime_statements:
+                    st.info('Translated USE statements:')
+                    for line in translated_runtime_statements:
+                        st.caption(line)
                 with st.expander('Developer handoff', expanded=False):
                     st.code(runtime_use_issue['developer_note'])
             if qid:
